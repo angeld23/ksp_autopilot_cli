@@ -1,0 +1,41 @@
+[package]
+name = "ksp"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1.41.1", features = ["full"] }
+tokio-macros = { version = "2.4.0" }
+krpc-client = { git = "https://github.com/kladd/krpc-client.git", features = [
+    "tokio",
+] }
+anyhow = "1.0.93"
+cgmath = "0.18.0"
+derive_more = { version = "1.0.0", features = [
+    "add",
+    "add_assign",
+    "as_ref",
+    "constructor",
+    "deref",
+    "deref_mut",
+    "display",
+    "error",
+    "from",
+    "from_str",
+    "index",
+    "index_mut",
+    "into",
+    "into_iterator",
+    "is_variant",
+    "mul",
+    "mul_assign",
+    "not",
+    "sum",
+    "try_from",
+    "try_into",
+    "try_unwrap",
+    "unwrap",
+] }
+env_logger = "0.11.5"
+log = "0.4.22"
+async-recursion = "1.1.1"
