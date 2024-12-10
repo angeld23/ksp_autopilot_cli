@@ -10,7 +10,7 @@ krpc-client = { git = "https://github.com/kladd/krpc-client.git", features = [
     "tokio",
 ] }
 anyhow = "1.0.93"
-cgmath = "0.18.0"
+cgmath = { version = "0.18.0", features = ["swizzle"] }
 derive_more = { version = "1.0.0", features = [
     "add",
     "add_assign",

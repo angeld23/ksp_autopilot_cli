@@ -1,12 +1,13 @@
 use core::f64;
 
 use anyhow::Result;
-use cgmath::{
-    num_traits::Signed, vec3, Angle, Deg, InnerSpace, Quaternion, Rad, Rotation, Rotation3,
-    Vector3, Zero,
+use cgmath::{vec3, Angle, InnerSpace, Quaternion, Rad, Rotation, Rotation3, Vector3, Zero};
+use krpc_client::services::space_center::{
+    CelestialBody, Node, Orbit, ReferenceFrame, SpaceCenter, Vessel,
 };
-use krpc_client::services::space_center::{CelestialBody, Node, Orbit, ReferenceFrame, Vessel};
-use log::debug;
+use log::warn;
+
+use crate::{root_finding::newton_find_all_roots, FlightComputer};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ThrustInfo {
@@ -15,10 +16,14 @@ pub struct ThrustInfo {
     pub vessel_mass: f64,
 }
 
-pub async fn get_vacuum_thrust_info(vessel: &Vessel) -> Result<ThrustInfo> {
+pub async fn get_thrust_info(vessel: &Vessel, pressure: Option<f64>) -> Result<ThrustInfo> {
     let reference_frame = vessel.get_reference_frame().await?;
     let parts = vessel.get_parts().await?;
     let engines = parts.get_engines().await?;
+
+    let pressure =
+        pressure.unwrap_or(vessel.flight(None).await?.get_static_pressure().await? as f64);
+    let pressure_atm = pressure / 101325.027;
 
     let vessel_direction: Vector3<f64> = vessel.direction(&reference_frame).await?.into();
 
@@ -26,7 +31,7 @@ pub async fn get_vacuum_thrust_info(vessel: &Vessel) -> Result<ThrustInfo> {
     let mut total_mass_flow = 0f64;
     for engine in engines {
         if engine.get_active().await? {
-            let thrust = engine.available_thrust_at(0.0).await? as f64;
+            let thrust = engine.available_thrust_at(pressure_atm).await? as f64;
             if thrust.is_zero() {
                 continue;
             }
@@ -55,7 +60,7 @@ pub async fn get_vacuum_thrust_info(vessel: &Vessel) -> Result<ThrustInfo> {
                 total_thrust += part_direction.dot(vessel_direction) * thrust;
             }
 
-            let isp = engine.get_vacuum_specific_impulse().await? as f64;
+            let isp = engine.specific_impulse_at(pressure_atm).await? as f64;
             total_mass_flow += thrust / (isp * 9.81);
         }
     }
@@ -73,12 +78,16 @@ pub struct BurnInfo {
     pub distance_covered: f64,
 }
 
-pub async fn get_burn_info(vessel: &Vessel, delta_v: f64) -> Result<BurnInfo> {
+pub async fn get_burn_info(
+    vessel: &Vessel,
+    delta_v: f64,
+    pressure: Option<f64>,
+) -> Result<BurnInfo> {
     let ThrustInfo {
         thrust,
         mass_flow,
         vessel_mass,
-    } = get_vacuum_thrust_info(vessel).await?;
+    } = get_thrust_info(vessel, pressure).await?;
 
     if thrust <= 0.0 {
         return Ok(BurnInfo {
@@ -139,35 +148,30 @@ pub async fn get_translation_force(
 
     let direction_vessel_frame = inverse_rotation * direction;
 
-    let mut total_thrust = 0f64;
-    let parts = vessel.get_parts().await?;
-    for rcs in parts.get_rcs().await? {
-        let (positive, negative) = rcs.get_available_force().await?;
-        let (positive, negative): (Vector3<f64>, Vector3<f64>) = (positive.into(), negative.into());
+    let (positive, negative) = vessel.get_available_rcs_force().await?;
+    let (positive, negative): (Vector3<f64>, Vector3<f64>) = (positive.into(), negative.into());
+    // actual rcs force is, as far as i can tell, exactly one fifth of what get_available_rcs_force claims. why????
+    let (positive, negative) = (positive / 5.0, negative / 5.0);
 
-        let forces = vec3(
-            if direction_vessel_frame.x.is_sign_positive() {
-                positive.x
-            } else {
-                negative.x
-            },
-            if direction_vessel_frame.y.is_sign_positive() {
-                positive.y
-            } else {
-                negative.y
-            },
-            if direction_vessel_frame.z.is_sign_positive() {
-                positive.z
-            } else {
-                negative.z
-            },
-        )
-        .map(|c| c.abs());
+    let forces = vec3(
+        if direction_vessel_frame.x.is_sign_positive() {
+            positive.x
+        } else {
+            negative.x
+        },
+        if direction_vessel_frame.y.is_sign_positive() {
+            positive.y
+        } else {
+            negative.y
+        },
+        if direction_vessel_frame.z.is_sign_positive() {
+            positive.z
+        } else {
+            negative.z
+        },
+    );
 
-        total_thrust += forces.dot(direction_vessel_frame);
-    }
-
-    Ok(total_thrust)
+    Ok(forces.dot(direction_vessel_frame))
 }
 
 pub async fn get_ascending_node_direction(
@@ -436,4 +440,269 @@ pub async fn ut_at_true_anomaly_offset(
     let ut = orbit.ut_at_true_anomaly(remainder.0).await?;
 
     Ok(ut + period * stacks)
+}
+
+/// this is so hacky
+pub async fn get_current_ut_from_orbit(orbit: &Orbit) -> Result<f64> {
+    Ok(orbit
+        .ut_at_true_anomaly(orbit.get_true_anomaly().await? - 0.00000001)
+        .await?
+        - orbit.get_period().await?)
+}
+
+pub async fn height_above_surface_at_position(
+    body: &CelestialBody,
+    body_position: Vector3<f64>,
+    reference_frame: &ReferenceFrame,
+) -> Result<f64> {
+    let (latitude, longitude) = (
+        body.latitude_at_position(body_position.into(), reference_frame)
+            .await?,
+        body.longitude_at_position(body_position.into(), reference_frame)
+            .await?,
+    );
+
+    Ok(body
+        .altitude_at_position(body_position.into(), reference_frame)
+        .await?
+        - body.surface_height(latitude, longitude).await?)
+}
+
+pub async fn surface_position(
+    body: &CelestialBody,
+    body_position: Vector3<f64>,
+) -> Result<Vector3<f64>> {
+    Ok(body_position
+        - body_position.normalize_to(
+            height_above_surface_at_position(
+                body,
+                body_position,
+                &body.get_reference_frame().await?,
+            )
+            .await?,
+        ))
+}
+
+pub async fn get_target_orbit(space_center: &SpaceCenter) -> Result<Option<Orbit>> {
+    Ok(
+        if let Some(target) = space_center.get_target_body().await? {
+            target.get_orbit().await?
+        } else if let Some(target) = space_center.get_target_vessel().await? {
+            Some(target.get_orbit().await?)
+        } else {
+            None
+        },
+    )
+}
+
+pub async fn best_surface_orbit_alignment_angles(
+    body_position: Vector3<f64>,
+    orbit_normal: Vector3<f64>,
+) -> Result<(Rad<f64>, Rad<f64>)> {
+    let circle_radius = body_position.xz().magnitude();
+
+    let mut function = |angle: f64| {
+        orbit_normal.dot(vec3(
+            angle.cos() * circle_radius,
+            body_position.y,
+            angle.sin() * circle_radius,
+        ))
+    };
+    let mut derivative = |angle: f64| {
+        -orbit_normal.x * circle_radius * angle.sin() + orbit_normal.z * circle_radius * angle.cos()
+    };
+    let mut derivative2 = |angle: f64| {
+        -orbit_normal.x * circle_radius * angle.cos() - orbit_normal.z * circle_radius * angle.sin()
+    };
+
+    let root_angles = newton_find_all_roots(
+        0.0,
+        Rad::full_turn().0,
+        100,
+        100,
+        &mut function,
+        &mut derivative,
+    );
+
+    let (angle_0, angle_1) = if root_angles.is_empty() {
+        let extrema_angles = newton_find_all_roots(
+            0.0,
+            Rad::full_turn().0,
+            100,
+            100,
+            &mut derivative,
+            &mut derivative2,
+        );
+        if extrema_angles.is_empty() {
+            warn!(
+                "best_surface_orbit_alignment_directions: couldn't even find any extrema angles?"
+            );
+            (0.0, 0.0)
+        } else {
+            let mut min_angle = *extrema_angles.first().unwrap();
+            let mut min = function(min_angle);
+            for angle in extrema_angles {
+                let product = function(angle);
+                if product < min {
+                    min_angle = angle;
+                    min = product;
+                }
+            }
+
+            (min_angle, min_angle)
+        }
+    } else {
+        let first = *root_angles.first().unwrap();
+        (first, *root_angles.get(2).unwrap_or(&first))
+    };
+
+    Ok((Rad(angle_0), Rad(angle_1)))
+}
+
+pub async fn throttle_for_acceleration(vessel: &Vessel, acceleration: f64) -> Result<f64> {
+    let ThrustInfo {
+        thrust,
+        vessel_mass,
+        ..
+    } = get_thrust_info(vessel, None).await?;
+
+    Ok(acceleration / (thrust / vessel_mass))
+}
+
+pub fn centrifugal_acceleration(
+    angular_velocity: Vector3<f64>,
+    body_position: Vector3<f64>,
+) -> Vector3<f64> {
+    let projected_position = flatten_vector(body_position, angular_velocity);
+    let circle_radius = projected_position.magnitude();
+    let latitude_speed = angular_velocity.magnitude() * circle_radius;
+    let centrifugal_acceleration = latitude_speed.powi(2) / circle_radius;
+
+    projected_position.normalize_to(centrifugal_acceleration)
+}
+
+pub fn gravitational_acceleration(
+    gravitational_parameter: f64,
+    body_position: Vector3<f64>,
+) -> Vector3<f64> {
+    -body_position.normalize_to(gravitational_parameter / body_position.magnitude2())
+}
+
+pub fn surface_acceleration(
+    gravitational_parameter: f64,
+    angular_velocity: Vector3<f64>,
+    body_position: Vector3<f64>,
+) -> Vector3<f64> {
+    gravitational_acceleration(gravitational_parameter, body_position)
+        + centrifugal_acceleration(angular_velocity, body_position)
+}
+
+impl FlightComputer {
+    pub async fn next_surface_orbit_alignment_delay(
+        &self,
+        body: &CelestialBody,
+        body_position: Vector3<f64>,
+        orbit_normal: Vector3<f64>,
+        angle_tolerance: impl Into<Rad<f64>>,
+    ) -> Result<f64> {
+        let angle_tolerance: Rad<f64> = angle_tolerance.into();
+
+        let body_reference_frame = body.get_reference_frame().await?;
+        let non_rotating_reference_frame = body.get_non_rotating_reference_frame().await?;
+        let absolute_position: Vector3<f64> = self
+            .space_center
+            .transform_position(
+                body_position.into(),
+                &body_reference_frame,
+                &non_rotating_reference_frame,
+            )
+            .await?
+            .into();
+        let current_angle = Rad::atan2(absolute_position.z, absolute_position.x);
+        let (angle_0, angle_1) =
+            best_surface_orbit_alignment_angles(body_position, orbit_normal).await?;
+        let (angle_diff_0, angle_diff_1) = (
+            (angle_0 - current_angle).normalize_signed(),
+            (angle_1 - current_angle).normalize_signed(),
+        );
+
+        if orbit_normal.angle(vec3(0.0, 1.0, 0.0)) > angle_tolerance
+            && Rad(angle_diff_0.0.abs().min(angle_diff_1.0.abs())) > angle_tolerance
+        {
+            let angle_diff =
+                if angle_diff_0.0.is_sign_positive() && angle_diff_1.0.is_sign_negative() {
+                    angle_diff_0
+                } else if angle_diff_0.0.is_sign_negative() && angle_diff_1.0.is_sign_positive() {
+                    angle_diff_1
+                } else {
+                    Rad(angle_diff_0.0.min(angle_diff_1.0)).normalize()
+                };
+
+            let wait_time = angle_diff / Rad(body.get_rotational_speed().await?);
+
+            Ok(wait_time)
+        } else {
+            Ok(0.0)
+        }
+    }
+
+    pub async fn body_position_of_absolute_position_at_ut(
+        &self,
+        body: &CelestialBody,
+        absolute_position: Vector3<f64>,
+        ut: f64,
+    ) -> Result<Vector3<f64>> {
+        let non_rotating_reference_frame = body.get_non_rotating_reference_frame().await?;
+        let body_reference_frame = body.get_reference_frame().await?;
+        let angular_velocity: Vector3<f64> = body
+            .angular_velocity(&non_rotating_reference_frame)
+            .await?
+            .into();
+
+        let rotation = Quaternion::from_axis_angle(
+            angular_velocity.normalize(),
+            -Rad(angular_velocity.magnitude()) * (ut - self.space_center.get_ut().await?),
+        );
+
+        Ok(self
+            .space_center
+            .transform_position(
+                (rotation * absolute_position).into(),
+                &non_rotating_reference_frame,
+                &body_reference_frame,
+            )
+            .await?
+            .into())
+    }
+
+    pub async fn body_velocity_of_absolute_velocity_at_ut(
+        &self,
+        body: &CelestialBody,
+        absolute_position: Vector3<f64>,
+        absolute_velocity: Vector3<f64>,
+        ut: f64,
+    ) -> Result<Vector3<f64>> {
+        let non_rotating_reference_frame = body.get_non_rotating_reference_frame().await?;
+        let body_reference_frame = body.get_reference_frame().await?;
+        let angular_velocity: Vector3<f64> = body
+            .angular_velocity(&non_rotating_reference_frame)
+            .await?
+            .into();
+
+        let rotation = Quaternion::from_axis_angle(
+            angular_velocity.normalize(),
+            -Rad(angular_velocity.magnitude()) * (ut - self.space_center.get_ut().await?),
+        );
+
+        Ok(self
+            .space_center
+            .transform_velocity(
+                (rotation * absolute_position).into(),
+                (rotation * absolute_velocity).into(),
+                &non_rotating_reference_frame,
+                &body_reference_frame,
+            )
+            .await?
+            .into())
+    }
 }

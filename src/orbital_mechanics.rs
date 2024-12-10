@@ -6,7 +6,7 @@ use async_recursion::async_recursion;
 use cgmath::{
     ulps_eq, vec2, vec3, Angle, InnerSpace, Quaternion, Rad, Rotation3, Vector2, Vector3,
 };
-use krpc_client::services::space_center::{CelestialBody, Orbit, SpaceCenter};
+use krpc_client::services::space_center::{CelestialBody, Control, Node, Orbit, SpaceCenter};
 
 use crate::util::flatten_vector;
 
@@ -64,7 +64,7 @@ impl LocalOrbit {
     }
 
     pub fn mean_motion(&self) -> Rad<f64> {
-        Rad((self.body.gravitational_parameter / self.semi_major_axis.powi(3).abs()).sqrt())
+        self.body.mean_motion_of_sma(self.semi_major_axis)
     }
 
     pub fn mean_anomaly_at_ut(&self, ut: f64) -> Rad<f64> {
@@ -72,7 +72,7 @@ impl LocalOrbit {
     }
 
     pub fn period(&self) -> f64 {
-        Rad::full_turn() / self.mean_motion()
+        self.body.orbital_period_of_sma(self.semi_major_axis)
     }
 
     pub fn semi_minor_axis(&self) -> f64 {
@@ -146,19 +146,27 @@ impl LocalOrbit {
         self.local_velocity_at_eccentric_anomaly(self.eccentric_anomaly_at_ut(ut))
     }
 
-    pub fn transform_local_vector(&self, local_vector: Vector2<f64>) -> Vector3<f64> {
+    pub fn local_to_absolute_vector(&self, local_vector: Vector2<f64>) -> Vector3<f64> {
         let x = self.periapsis_direction();
         let y = x.cross(self.normal());
 
         local_vector.x * x + local_vector.y * y
     }
 
+    pub fn absolute_to_local_vector(&self, absolute: Vector3<f64>) -> Vector2<f64> {
+        let absolute = flatten_vector(absolute, self.normal());
+        let x = self.periapsis_direction();
+        let y = x.cross(self.normal());
+
+        vec2(x.dot(absolute), y.dot(absolute))
+    }
+
     pub fn position_at_ut(&self, ut: f64) -> Vector3<f64> {
-        self.transform_local_vector(self.local_position_at_ut(ut))
+        self.local_to_absolute_vector(self.local_position_at_ut(ut))
     }
 
     pub fn velocity_at_ut(&self, ut: f64) -> Vector3<f64> {
-        self.transform_local_vector(self.local_velocity_at_ut(ut))
+        self.local_to_absolute_vector(self.local_velocity_at_ut(ut))
     }
 
     pub fn true_anomaly_at_ut(&self, ut: f64) -> Rad<f64> {
@@ -255,9 +263,18 @@ impl LocalOrbit {
         self.mean_anomaly_of_eccentric_anomaly(self.eccentric_anomaly_of_true_anomaly(true_anomaly))
     }
 
-    pub fn true_anomaly_of_eccentric_anomaly(&self, eccentric_anomaly: Rad<f64>) -> Rad<f64> {
-        let local_position = self.local_position_at_eccentric_anomaly(eccentric_anomaly);
+    pub fn true_anomaly_of_local_position(&self, local_position: Vector2<f64>) -> Rad<f64> {
         Rad(local_position.y.atan2(local_position.x))
+    }
+
+    pub fn true_anomaly_of_position(&self, position: Vector3<f64>) -> Rad<f64> {
+        self.true_anomaly_of_local_position(self.absolute_to_local_vector(position))
+    }
+
+    pub fn true_anomaly_of_eccentric_anomaly(&self, eccentric_anomaly: Rad<f64>) -> Rad<f64> {
+        self.true_anomaly_of_local_position(
+            self.local_position_at_eccentric_anomaly(eccentric_anomaly),
+        )
     }
 
     pub fn true_anomaly_time_delay(&self, true_anomaly_offset: Rad<f64>) -> f64 {
@@ -276,10 +293,11 @@ impl LocalOrbit {
         other: &LocalOrbit,
         start_ut: f64,
         look_ahead: f64,
-    ) -> Option<(f64, f64)> {
-        if self.body.name != other.body.name {
-            return None;
-        }
+    ) -> (f64, f64) {
+        assert_eq!(
+            self.body.name, other.body.name,
+            "parent bodies do not match"
+        );
 
         let increments = 360;
 
@@ -314,10 +332,10 @@ impl LocalOrbit {
             let position_1 = other.position_at_ut(start_ut);
             let distance = (position_0 - position_1).magnitude();
 
-            return Some((start_ut, distance));
+            return (start_ut, distance);
         }
 
-        Some((closest_ut, closest_distance))
+        (closest_ut, closest_distance)
     }
 
     pub fn will_escape(&self) -> bool {
@@ -378,7 +396,7 @@ impl LocalOrbit {
         }
     }
 
-    pub fn create_trajectory(&self, ut: f64) -> OrbitalTrajectory {
+    pub fn singleton_trajectory(&self, ut: f64) -> OrbitalTrajectory {
         OrbitalTrajectory {
             state_changes: vec![self.get_orbital_state_change(ut)],
         }
@@ -405,9 +423,17 @@ impl LocalOrbit {
         let normal = self.normal();
         let radial = self.radial(ut);
 
-        absolute.dot(prograde) * prograde
-            + absolute.dot(normal) * normal
-            + absolute.dot(radial) * radial
+        vec3(
+            absolute.dot(prograde),
+            absolute.dot(normal),
+            absolute.dot(radial),
+        )
+    }
+
+    pub fn most_recent_periapsis_ut(&self, current_ut: f64) -> f64 {
+        let elapsed = current_ut - self.periapsis_epoch();
+
+        self.periapsis_epoch() + self.period() * (elapsed / self.period()).floor()
     }
 }
 
@@ -511,7 +537,7 @@ impl LocalBody {
         let body_orbit = self.orbit.as_ref()?;
         let closest_approach_ut = if !orbit.is_elliptical() {
             let (closest_approach_ut, closest_approach_distance) =
-                orbit.find_closest_approach(body_orbit, start_ut, look_ahead)?;
+                orbit.find_closest_approach(body_orbit, start_ut, look_ahead);
             if closest_approach_distance > self.sphere_of_influence {
                 return None;
             }
@@ -527,17 +553,15 @@ impl LocalBody {
                     orbit.period()
                 };
 
-                if let Some((closest_approach_ut, closest_approach_distance)) = orbit
-                    .find_closest_approach(
-                        body_orbit,
-                        start_ut + orbit.period() * i as f64,
-                        cycle_look_ahead,
-                    )
-                {
-                    if closest_approach_distance <= self.sphere_of_influence {
-                        earliest_closest_approach_ut = Some(closest_approach_ut);
-                        break 'per_cycle_search;
-                    }
+                let (closest_approach_ut, closest_approach_distance) = orbit.find_closest_approach(
+                    body_orbit,
+                    start_ut + orbit.period() * i as f64,
+                    cycle_look_ahead,
+                );
+
+                if closest_approach_distance <= self.sphere_of_influence {
+                    earliest_closest_approach_ut = Some(closest_approach_ut);
+                    break 'per_cycle_search;
                 }
             }
 
@@ -569,8 +593,20 @@ impl LocalBody {
         Some(bisect_end)
     }
 
-    pub fn get_circular_orbit_speed(&self, radius: f64) -> f64 {
+    pub fn circular_orbit_speed(&self, radius: f64) -> f64 {
         (self.gravitational_parameter / radius).sqrt()
+    }
+
+    pub fn orbital_speed_from_sma_and_radius(&self, sma: f64, radius: f64) -> f64 {
+        (self.gravitational_parameter * (2.0 / radius - 1.0 / sma)).sqrt()
+    }
+
+    pub fn mean_motion_of_sma(&self, sma: f64) -> Rad<f64> {
+        Rad((self.gravitational_parameter / sma.powi(3).abs()).sqrt())
+    }
+
+    pub fn orbital_period_of_sma(&self, sma: f64) -> f64 {
+        Rad::full_turn() / self.mean_motion_of_sma(sma)
     }
 }
 
@@ -583,6 +619,21 @@ pub struct OrbitalStateChange {
 }
 
 impl OrbitalStateChange {
+    pub async fn from_node(node: &Node) -> Result<Self> {
+        let non_local_orbit = node.get_orbit().await?;
+        let orbit = LocalOrbit::from_orbit(&non_local_orbit).await?;
+        let ut = node.get_ut().await?;
+
+        Ok(Self {
+            body: Box::into_inner(orbit.body.clone()),
+            ut,
+            position: orbit.position_at_ut(ut),
+            velocity: orbit.velocity_at_ut(ut)
+                + orbit
+                    .prograde_normal_radial_to_absolute(ut, node.burn_vector(None).await?.into()),
+        })
+    }
+
     pub fn orbit(&self) -> LocalOrbit {
         self.body
             .create_orbit_from_state_vectors(self.ut, self.position, self.velocity)
@@ -612,6 +663,55 @@ impl OrbitalTrajectory {
 
     pub fn orbit_at_ut(&self, ut: f64) -> LocalOrbit {
         self.state_change_at_ut(ut).orbit()
+    }
+
+    pub fn prune(&mut self, latest_ut: f64) {
+        self.state_changes
+            .retain(|state_change| state_change.ut <= latest_ut);
+    }
+
+    pub async fn add_node(&mut self, node: &Node) -> Result<()> {
+        let ut = node.get_ut().await?;
+        let orbit = self.orbit_at_ut(ut);
+
+        self.prune(ut);
+        self.state_changes.push(OrbitalStateChange {
+            body: Box::into_inner(orbit.body.clone()),
+            ut,
+            position: orbit.position_at_ut(ut),
+            velocity: orbit.velocity_at_ut(ut)
+                + orbit
+                    .prograde_normal_radial_to_absolute(ut, node.burn_vector(None).await?.into()),
+        });
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct LocalNode {
+    pub ut: f64,
+    pub burn_vector: Vector3<f64>,
+}
+
+impl LocalNode {
+    pub async fn from_node(node: &Node) -> Result<Self> {
+        Ok(Self {
+            ut: node.get_ut().await?,
+            burn_vector: node.burn_vector(None).await?.into(),
+        })
+    }
+
+    pub async fn add(&self, control: &Control) -> Result<()> {
+        control
+            .add_node(
+                self.ut,
+                self.burn_vector.x as f32,
+                self.burn_vector.y as f32,
+                self.burn_vector.z as f32,
+            )
+            .await?;
+        Ok(())
     }
 }
 

@@ -8,7 +8,9 @@ use tokio::time;
 
 use crate::{
     translation::TranslationTarget,
-    util::{get_burn_info, get_next_node, get_translation_force, node_exists},
+    util::{
+        get_burn_info, get_next_node, get_translation_force, node_exists, throttle_for_acceleration,
+    },
     FlightComputer,
 };
 
@@ -34,7 +36,7 @@ impl FlightComputer {
         let exit_margin_threshold: Rad<f64> = Deg(3.0).into();
 
         let total_delta_v = node.get_remaining_delta_v().await?;
-        let burn_info = get_burn_info(&self.vessel, total_delta_v).await?;
+        let burn_info = get_burn_info(&self.vessel, total_delta_v, Some(0.0)).await?;
 
         debug!(
             "executing node:\n\tΔv = {:.3}m/s\n\tΔt = {:.2}s\n\tΔs = {:.1}m",
@@ -44,7 +46,12 @@ impl FlightComputer {
 
         let mut warped = false;
 
-        let mut interval = time::interval(Duration::from_secs_f64(1.0 / 30.0));
+        {
+            let mut translation_controller = self.translation_controller.lock().await;
+            translation_controller.reset(&self.vessel).await?;
+        }
+
+        let mut interval = time::interval(Duration::from_secs_f64(1.0 / 20.0));
         loop {
             interval.tick().await;
             if !node_exists(node, &self.vessel).await? {
@@ -71,7 +78,7 @@ impl FlightComputer {
                 warped = true;
                 self.space_center
                     .warp_to(
-                        node.get_ut().await? - burn_info.burn_time / 2.0 - 5.0,
+                        node.get_ut().await? - burn_info.burn_time / 2.0,
                         f32::INFINITY,
                         f32::INFINITY,
                     )
@@ -91,7 +98,9 @@ impl FlightComputer {
             )
             .await?;
 
-            let should_use_rcs = try_rcs && rcs_force > 0.1;
+            let mass = self.vessel.get_mass().await? as f64;
+            let rcs_burn_time = remaining_delta_v / (rcs_force / mass);
+            let should_use_rcs = try_rcs && rcs_burn_time < 1.0;
 
             let time_to_node = node.get_time_to().await?;
             let burn_started = time_to_node <= burn_info.burn_time / 2.0;
@@ -99,14 +108,20 @@ impl FlightComputer {
             if burn_started {
                 if should_use_rcs {
                     control.set_throttle(0.0).await?;
+
                     translation_controller.enabled = true;
+                    translation_controller.rcs_enabled = true;
                     translation_controller.reference_frame =
                         Some(node.get_reference_frame().await?);
                     translation_controller.target =
-                        TranslationTarget::Throttle(vec3(0.0, 1.0, 0.0));
+                        TranslationTarget::Acceleration(vec3(0.0, 10.0, 0.0));
                 } else if within_margin {
                     control
-                        .set_throttle(if remaining_delta_v <= 1.0 { 0.25 } else { 1.0 })
+                        .set_throttle(if remaining_delta_v <= 10.0 {
+                            throttle_for_acceleration(&self.vessel, 10.0).await?
+                        } else {
+                            1.0
+                        } as f32)
                         .await?;
                     translation_controller.reset(&self.vessel).await?;
                 } else {

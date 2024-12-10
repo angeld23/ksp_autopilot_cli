@@ -2,21 +2,13 @@ use core::f32;
 use std::time::Duration;
 
 use anyhow::Result;
-use cgmath::{vec3, Deg, ElementWise, InnerSpace, Quaternion, Rad, Rotation3, Vector3, Zero};
+use cgmath::{vec3, Deg, ElementWise, InnerSpace, Quaternion, Rotation3, Vector3};
 use derive_more::*;
 use krpc_client::services::space_center::ReferenceFrame;
 use log::debug;
 use tokio::time;
 
-use crate::{
-    maneuver::{node_change_velocity, node_circularize},
-    util::{
-        flatten_vector, get_circular_orbit_speed, get_orbit_normal,
-        get_relative_ascending_node_direction, get_relative_descending_node_direction,
-        is_below_plane,
-    },
-    FlightComputer,
-};
+use crate::{maneuver::node_circularize, util::get_orbit_normal, FlightComputer};
 
 #[derive(IsVariant, Unwrap)]
 pub enum InclinationTarget {
@@ -61,12 +53,13 @@ impl FlightComputer {
         let orbit = self.vessel.get_orbit().await?;
         let body = orbit.get_body().await?;
         let body_reference_frame = body.get_reference_frame().await?;
+        let non_rotating_reference_frame = body.get_non_rotating_reference_frame().await?;
 
         let flight = self.vessel.flight(Some(&body_reference_frame)).await?;
         let atmosphere_height = body.get_atmosphere_depth().await?;
 
         let position: Vector3<f64> = self.vessel.position(&body_reference_frame).await?.into();
-        let orbit_normal: Vector3<f64> = match descriptor.inclination_target {
+        let body_orbit_normal: Vector3<f64> = match descriptor.inclination_target {
             InclinationTarget::Inclination(inclination) => {
                 Quaternion::from_axis_angle(
                     position.mul_element_wise(vec3(1.0, 0.0, 1.0)).normalize(),
@@ -79,45 +72,34 @@ impl FlightComputer {
                 .await?
                 .into(),
         };
-        let orbit_normal = if orbit_normal.magnitude() > 0.0 {
-            orbit_normal.normalize()
+        let body_orbit_normal = if body_orbit_normal.magnitude() > 0.0 {
+            body_orbit_normal.normalize()
         } else {
             vec3(0.0, 1.0, 0.0)
         };
+        let orbit_normal: Vector3<f64> = self
+            .space_center
+            .transform_direction(
+                body_orbit_normal.into(),
+                &body_reference_frame,
+                &non_rotating_reference_frame,
+            )
+            .await?
+            .into();
 
-        // wait for alignment
-        let normalized_position = position.normalize();
-
-        let ascending_node_direction =
-            get_relative_ascending_node_direction(vec3(0.0, 1.0, 0.0), orbit_normal);
-        let descending_node_direction =
-            get_relative_descending_node_direction(vec3(0.0, 1.0, 0.0), orbit_normal);
-
-        let ascending_angle = ascending_node_direction.angle(normalized_position);
-        let descending_angle = descending_node_direction.angle(normalized_position);
-
-        let angle_tolerance = Rad::from(Deg(1.0));
-        if orbit_normal.angle(vec3(0.0, 1.0, 0.0)) > angle_tolerance
-            && Rad(ascending_angle.0.min(descending_angle.0)) > angle_tolerance
-        {
-            let is_before_ascending = normalized_position
-                .cross(ascending_node_direction)
-                .y
-                .is_sign_negative();
-            let angle = if is_before_ascending {
-                ascending_angle
-            } else {
-                descending_angle
-            };
-            let wait_time = angle / Rad(body.get_rotational_speed().await?);
-
-            debug!("waiting for proper alignment... ({:.0}s)", wait_time);
-
+        let alignment_wait_time = self
+            .next_surface_orbit_alignment_delay(&body, position, orbit_normal, Deg(1.0))
+            .await?;
+        if alignment_wait_time > 0.0 {
+            debug!(
+                "waiting for proper alignment... ({:.0}s)",
+                alignment_wait_time
+            );
             let ut = self.space_center.get_ut().await?;
             self.space_center
-                .warp_to(ut + wait_time, f32::INFINITY, f32::INFINITY)
+                .warp_to(ut + alignment_wait_time, f32::INFINITY, f32::INFINITY)
                 .await?;
-            self.wait_until(ut + wait_time).await?;
+            self.wait_until(ut + alignment_wait_time).await?;
         }
 
         debug!(
@@ -135,7 +117,7 @@ impl FlightComputer {
 
         let mut atmosphere_warp_active = false;
 
-        let mut interval = time::interval(Duration::from_secs_f64(1.0 / 30.0));
+        let mut interval = time::interval(Duration::from_secs_f64(1.0 / 20.0));
         loop {
             interval.tick().await;
 
@@ -160,10 +142,10 @@ impl FlightComputer {
 
             let current_orbit_normal = get_orbit_normal(&orbit, &body_reference_frame).await?;
             let orbit_normal_error_rotation =
-                Quaternion::from_arc(current_orbit_normal, orbit_normal, None);
+                Quaternion::from_arc(current_orbit_normal, body_orbit_normal, None);
 
             let target_rotation = Quaternion::from_axis_angle(
-                orbit_normal_error_rotation * orbit_normal,
+                orbit_normal_error_rotation * body_orbit_normal,
                 -target_turn_angle,
             );
             let target_direction = target_rotation * position.normalize();
@@ -221,25 +203,9 @@ impl FlightComputer {
 
             let ut = self.space_center.get_ut().await?;
             let time_to_apoapsis = orbit.get_time_to_apoapsis().await?;
-            let apoapsis_radius = orbit.get_apoapsis().await?;
-            let desired_speed = get_circular_orbit_speed(&body, apoapsis_radius).await?;
-            let apoapsis_position: Vector3<f64> = orbit
-                .position_at(ut + time_to_apoapsis, &body_reference_frame)
-                .await?
-                .into();
 
-            self.execute_node(
-                &node_change_velocity(
-                    &self.vessel,
-                    ut + time_to_apoapsis,
-                    apoapsis_position
-                        .cross(orbit_normal)
-                        .normalize_to(desired_speed),
-                    Some(&body_reference_frame),
-                )
-                .await?,
-            )
-            .await?;
+            self.execute_node(&node_circularize(&self.vessel, ut + time_to_apoapsis).await?)
+                .await?;
 
             if descriptor.correct_lobsided_orbit {
                 let apoapsis = orbit.get_apoapsis_altitude().await?;
