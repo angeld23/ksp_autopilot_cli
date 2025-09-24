@@ -1,13 +1,15 @@
 use core::f64;
 
-use anyhow::Result;
-use cgmath::{vec3, Angle, InnerSpace, Quaternion, Rad, Rotation, Rotation3, Vector3, Zero};
+use anyhow::{anyhow, Result};
+use cgmath::{
+    vec3, Angle, Deg, InnerSpace, One, Quaternion, Rad, Rotation, Rotation3, Vector3, Zero,
+};
 use krpc_client::services::space_center::{
-    CelestialBody, Node, Orbit, ReferenceFrame, SpaceCenter, Vessel,
+    AutoPilot, CelestialBody, Node, Orbit, ReferenceFrame, SpaceCenter, Vessel,
 };
 use log::warn;
 
-use crate::{root_finding::newton_find_all_roots, FlightComputer};
+use crate::{orbital_mechanics::LocalOrbit, root_finding::newton_find_all_roots, FlightComputer};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ThrustInfo {
@@ -455,17 +457,14 @@ pub async fn height_above_surface_at_position(
     body_position: Vector3<f64>,
     reference_frame: &ReferenceFrame,
 ) -> Result<f64> {
-    let (latitude, longitude) = (
-        body.latitude_at_position(body_position.into(), reference_frame)
-            .await?,
-        body.longitude_at_position(body_position.into(), reference_frame)
-            .await?,
-    );
+    let (latitude, longitude) = coordinates_of_body_position(body_position);
 
     Ok(body
         .altitude_at_position(body_position.into(), reference_frame)
         .await?
-        - body.surface_height(latitude, longitude).await?)
+        - body
+            .surface_height(Deg::from(latitude).0, Deg::from(longitude).0)
+            .await?)
 }
 
 pub async fn surface_position(
@@ -481,6 +480,38 @@ pub async fn surface_position(
             )
             .await?,
         ))
+}
+
+pub fn direction_of_coordinates(
+    latitude: impl Into<Rad<f64>>,
+    longitude: impl Into<Rad<f64>>,
+) -> Vector3<f64> {
+    let latitude: Rad<f64> = latitude.into();
+    let longitude: Rad<f64> = longitude.into();
+
+    let r = latitude.cos();
+
+    vec3(longitude.cos() * r, latitude.sin(), longitude.sin() * r)
+}
+
+pub fn coordinates_of_body_position(body_position: Vector3<f64>) -> (Rad<f64>, Rad<f64>) {
+    let direction = body_position.normalize();
+    if direction.magnitude().is_nan() {
+        return (Rad(0.0), Rad(0.0));
+    }
+
+    let latitude = Rad(direction.y.asin());
+    let longitude = Rad::atan2(direction.z, direction.x);
+
+    (latitude, longitude)
+}
+
+pub async fn surface_position_at_coordinates(
+    body: &CelestialBody,
+    latitude: impl Into<Rad<f64>>,
+    longitude: impl Into<Rad<f64>>,
+) -> Result<Vector3<f64>> {
+    surface_position(body, direction_of_coordinates(latitude, longitude)).await
 }
 
 pub async fn get_target_orbit(space_center: &SpaceCenter) -> Result<Option<Orbit>> {
@@ -540,9 +571,9 @@ pub async fn best_surface_orbit_alignment_angles(
             (0.0, 0.0)
         } else {
             let mut min_angle = *extrema_angles.first().unwrap();
-            let mut min = function(min_angle);
+            let mut min = function(min_angle).abs();
             for angle in extrema_angles {
-                let product = function(angle);
+                let product = function(angle).abs();
                 if product < min {
                     min_angle = angle;
                     min = product;
@@ -575,10 +606,16 @@ pub fn centrifugal_acceleration(
 ) -> Vector3<f64> {
     let projected_position = flatten_vector(body_position, angular_velocity);
     let circle_radius = projected_position.magnitude();
-    let latitude_speed = angular_velocity.magnitude() * circle_radius;
-    let centrifugal_acceleration = latitude_speed.powi(2) / circle_radius;
+    let centrifugal_acceleration = angular_velocity.magnitude2() * circle_radius;
 
     projected_position.normalize_to(centrifugal_acceleration)
+}
+
+pub fn coriolis_acceleration(
+    angular_velocity: Vector3<f64>,
+    body_velocity: Vector3<f64>,
+) -> Vector3<f64> {
+    2.0 * body_velocity.cross(angular_velocity)
 }
 
 pub fn gravitational_acceleration(
@@ -588,13 +625,76 @@ pub fn gravitational_acceleration(
     -body_position.normalize_to(gravitational_parameter / body_position.magnitude2())
 }
 
-pub fn surface_acceleration(
+pub fn apparent_acceleration(
     gravitational_parameter: f64,
     angular_velocity: Vector3<f64>,
     body_position: Vector3<f64>,
+    body_velocity: Vector3<f64>,
 ) -> Vector3<f64> {
     gravitational_acceleration(gravitational_parameter, body_position)
+        + coriolis_acceleration(angular_velocity, body_velocity)
         + centrifugal_acceleration(angular_velocity, body_position)
+}
+
+pub async fn vessel_local_orbit(vessel: &Vessel) -> Result<LocalOrbit> {
+    LocalOrbit::from_orbit(&vessel.get_orbit().await?).await
+}
+
+pub async fn body_local_orbit(body: &CelestialBody) -> Result<LocalOrbit> {
+    LocalOrbit::from_orbit(
+        &body
+            .get_orbit()
+            .await?
+            .ok_or(anyhow!("body has no orbit"))?,
+    )
+    .await
+}
+
+pub async fn approximate_vessel_radius(vessel: &Vessel) -> Result<f64> {
+    let vessel_frame = vessel.get_reference_frame().await?;
+
+    let mut furthest_distance = 0.0;
+    for part in vessel.get_parts().await?.get_all().await? {
+        let position: Vector3<f64> = part.position(&vessel_frame).await?.into();
+        let distance = position.magnitude();
+        if distance > furthest_distance {
+            furthest_distance = distance;
+        }
+    }
+
+    Ok(furthest_distance)
+}
+
+pub fn rotation_to_direction_and_roll(rotation: Quaternion<f64>) -> (Vector3<f64>, Rad<f64>) {
+    let direction = rotation * vec3(0.0, 1.0, 0.0);
+    let up = rotation * vec3(0.0, 0.0, -1.0);
+    let plane_normal = direction.cross(vec3(1.0, 0.0, 0.0));
+
+    let roll = up.angle(plane_normal);
+    let roll = if up.x.is_sign_positive() { roll } else { -roll };
+    let roll = (roll - Rad::full_turn() / 4.0).normalize_signed();
+
+    (direction, roll)
+}
+
+pub async fn set_target_rotation(auto_pilot: &AutoPilot, rotation: Quaternion<f64>) -> Result<()> {
+    let (direction, roll) = rotation_to_direction_and_roll(rotation);
+
+    auto_pilot.set_target_direction(direction.into()).await?;
+    auto_pilot.set_target_roll(Deg::from(roll).0 as f32).await?;
+
+    Ok(())
+}
+
+pub fn normalize_quaternion_angle(
+    quaternion: Quaternion<f64>,
+    angle: impl Into<Rad<f64>>,
+) -> Quaternion<f64> {
+    let angle: Rad<f64> = angle.into();
+    let quaternion = quaternion.normalize();
+    let old_angle = Quaternion::one().angle(quaternion);
+
+    Quaternion::one().slerp(quaternion, angle / old_angle)
 }
 
 impl FlightComputer {
@@ -621,12 +721,18 @@ impl FlightComputer {
         let current_angle = Rad::atan2(absolute_position.z, absolute_position.x);
         let (angle_0, angle_1) =
             best_surface_orbit_alignment_angles(body_position, orbit_normal).await?;
+
         let (angle_diff_0, angle_diff_1) = (
             (angle_0 - current_angle).normalize_signed(),
             (angle_1 - current_angle).normalize_signed(),
         );
 
         if orbit_normal.angle(vec3(0.0, 1.0, 0.0)) > angle_tolerance
+            && Rad(
+                (orbit_normal.angle(absolute_position) - Rad::full_turn() / 4.0)
+                    .0
+                    .abs(),
+            ) > angle_tolerance
             && Rad(angle_diff_0.0.abs().min(angle_diff_1.0.abs())) > angle_tolerance
         {
             let angle_diff =

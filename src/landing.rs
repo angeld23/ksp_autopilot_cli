@@ -13,7 +13,10 @@ use crate::{
         SurfaceTrajectory, SurfaceTrajectoryKeyframe, TrajectoryPredictionConfig,
     },
     translation::TranslationTarget,
-    util::{flatten_vector, get_burn_info, surface_position, throttle_for_acceleration},
+    util::{
+        flatten_vector, get_burn_info, surface_position, throttle_for_acceleration,
+        vessel_local_orbit,
+    },
     FlightComputer,
 };
 
@@ -24,8 +27,15 @@ pub struct LandingDescriptor {
     pub hover_height: f64,
     pub touchdown_speed: f64,
     pub use_rcs: bool,
-    pub max_tilt: Deg<f64>,
+    pub full_stop_max_tilt: Deg<f64>,
+    pub final_hop_max_tilt: Deg<f64>,
+    pub hover_max_tilt: Deg<f64>,
+    pub final_descent_max_tilt: Deg<f64>,
+    pub skip_suicide_burn: bool,
+    pub only_kill_vertical_velocity: bool,
+    pub suicide_burn_start_factor: f64,
     pub max_hover_approach_speed: f64,
+    pub max_stopped_velocity: f64,
     pub perform_orbital_correction: bool,
     pub undershoot_compensation: bool,
 }
@@ -38,8 +48,15 @@ impl Default for LandingDescriptor {
             hover_height: 30.0,
             touchdown_speed: 1.0,
             use_rcs: true,
-            max_tilt: Deg(30.0),
+            full_stop_max_tilt: Deg(75.0),
+            final_hop_max_tilt: Deg(30.0),
+            hover_max_tilt: Deg(30.0),
+            final_descent_max_tilt: Deg(1.0),
+            skip_suicide_burn: false,
+            only_kill_vertical_velocity: false,
+            suicide_burn_start_factor: 1.1,
             max_hover_approach_speed: 500.0,
+            max_stopped_velocity: 0.25,
             perform_orbital_correction: true,
             undershoot_compensation: true,
         }
@@ -109,7 +126,14 @@ impl FlightComputer {
                 .into();
 
             self.execute_node(
-                &node_change_orbit_normal(&self.vessel, new_orbit_normal, true).await?,
+                &node_change_orbit_normal(
+                    &vessel_local_orbit(&self.vessel).await?,
+                    new_orbit_normal,
+                    true,
+                    self.space_center.get_ut().await?,
+                )
+                .to_node(&self.vessel)
+                .await?,
             )
             .await?;
         }
@@ -120,7 +144,10 @@ impl FlightComputer {
             .await?;
 
         if alignment_wait_time > 0.0 {
-            debug!("waiting for proper alignment...");
+            debug!(
+                "waiting for proper alignment... ({:.0}s)",
+                alignment_wait_time
+            );
 
             let ut = self.space_center.get_ut().await?;
             self.space_center
@@ -176,21 +203,14 @@ impl FlightComputer {
                 deorbit_ut,
             )
             .await?;
-
-        let body_orbit_normal: Vector3<f64> = self
-            .space_center
-            .transform_direction(
-                orbit.normal().into(),
-                &non_rotating_reference_frame,
-                &body_reference_frame,
-            )
-            .await?
-            .into();
+        let body_orbit_normal = self
+            .body_position_of_absolute_position_at_ut(&body, orbit.normal(), deorbit_ut)
+            .await?;
 
         debug!("calculating deorbit burn...");
         let new_speed = {
-            let mut start = vec3(0.0, 0.0, 0.0);
-            let mut end = deorbit_body_velocity;
+            let mut start = -deorbit_body_velocity * 2.0;
+            let mut end = deorbit_body_velocity * 2.0;
             for _ in 0..15 {
                 let middle = (start + end) / 2.0;
 
@@ -236,8 +256,16 @@ impl FlightComputer {
             new_velocity.magnitude()
         };
 
-        self.execute_node(&node_change_speed(&self.vessel, deorbit_ut, new_speed).await?)
-            .await?;
+        self.execute_node(
+            &node_change_speed(
+                &vessel_local_orbit(&self.vessel).await?,
+                deorbit_ut,
+                new_speed,
+            )
+            .to_node(&self.vessel)
+            .await?,
+        )
+        .await?;
 
         debug!("deorbit procedure finished");
 
@@ -304,9 +332,10 @@ impl FlightComputer {
         // used to detect when we've touched down
         let mut last_time_not_stationary = self.space_center.get_ut().await?;
 
-        let mut impact_adjustment_active = descriptor.perform_orbital_correction;
-        let mut full_stop_started = false;
-        let mut full_stop_complete = false;
+        let mut impact_adjustment_active =
+            descriptor.perform_orbital_correction && !descriptor.skip_suicide_burn;
+        let mut full_stop_started = descriptor.skip_suicide_burn;
+        let mut full_stop_complete = descriptor.skip_suicide_burn;
         let mut final_hop_complete = false;
         let mut final_descent_active = false;
 
@@ -330,6 +359,7 @@ impl FlightComputer {
                 },
             )
             .await?;
+
             if let Some(approx_impact) = approx_trajectory.impact {
                 // once we know the impact exists, we can use a more precise trajectory without worrying about
                 // wasting RPCs
@@ -396,7 +426,8 @@ impl FlightComputer {
                         get_burn_info(&self.vessel, velocity.magnitude(), None).await?;
 
                     // we have to kill the velocity when either the time is right or we're already close enough
-                    if suicide_burn_info.burn_time * 1.1 >= impact_in
+                    if suicide_burn_info.burn_time * descriptor.suicide_burn_start_factor
+                        >= impact_in
                         || ((current_position - target_position).magnitude()
                             < (margin * 10.0).max(100.0)
                             && velocity.magnitude() < 50.0)
@@ -410,7 +441,7 @@ impl FlightComputer {
                     }
 
                     if impact_adjustment_active {
-                        if impact_error.magnitude() < (margin * 3.0).max(300.0) {
+                        if impact_error.magnitude() < (margin * 3.0).max(50.0) {
                             debug!("finished initial impact adjustment. coasting...");
                             impact_adjustment_active = false;
                             control.set_throttle(0.0).await?;
@@ -423,8 +454,10 @@ impl FlightComputer {
 
                             let throttle = if impact_error.magnitude() > 5000.0 {
                                 1.0
-                            } else {
+                            } else if impact_error.magnitude() > 1000.0 {
                                 throttle_for_acceleration(&self.vessel, 10.0).await?
+                            } else {
+                                throttle_for_acceleration(&self.vessel, 1.0).await?
                             };
 
                             let direction: Vector3<f64> =
@@ -444,7 +477,12 @@ impl FlightComputer {
                     {
                         let mut translation_controller = self.translation_controller.lock().await;
 
-                        if velocity.magnitude() < 0.25 {
+                        let speed_to_kill = if descriptor.only_kill_vertical_velocity {
+                            velocity.dot(current_position.normalize()).abs()
+                        } else {
+                            velocity.magnitude()
+                        };
+                        if speed_to_kill < descriptor.max_stopped_velocity {
                             if !full_stop_complete {
                                 debug!("velocity killed, performing final hop...")
                             }
@@ -460,11 +498,10 @@ impl FlightComputer {
                                 final_hop_complete = true;
                             }
 
-                            translation_controller.vtol_max_tilt = descriptor.max_tilt;
                             if final_hop_complete {
                                 let target_hover_position = target_position
                                     + target_position.normalize_to(descriptor.hover_height);
-                                if velocity.magnitude() <= 0.25
+                                if velocity.magnitude() <= descriptor.max_stopped_velocity
                                     && (current_position - target_hover_position).magnitude()
                                         <= margin
                                 {
@@ -475,9 +512,10 @@ impl FlightComputer {
                                 }
 
                                 if final_descent_active {
-                                    translation_controller.vtol_max_tilt = Deg(1.0);
+                                    translation_controller.vtol_max_tilt =
+                                        descriptor.final_descent_max_tilt;
                                     let altitude_diff =
-                                        current_position.magnitude() - target_position.magnitude();
+                                        current_position.magnitude() - impact.position.magnitude();
                                     translation_controller.target = TranslationTarget::Velocity(
                                         -current_position.normalize_to(
                                             descriptor.touchdown_speed + altitude_diff / 5.0,
@@ -491,6 +529,8 @@ impl FlightComputer {
                                         break;
                                     }
                                 } else {
+                                    translation_controller.vtol_max_tilt =
+                                        descriptor.hover_max_tilt;
                                     translation_controller.target = TranslationTarget::Position {
                                         pos: target_hover_position,
                                         max_speed: descriptor.max_hover_approach_speed,
@@ -498,13 +538,15 @@ impl FlightComputer {
                                     };
                                 }
                             } else {
+                                translation_controller.vtol_max_tilt =
+                                    descriptor.final_hop_max_tilt;
                                 translation_controller.target = TranslationTarget::Acceleration(
                                     impact_error.normalize_to(impact_error.magnitude().min(100.0)),
                                 );
                             }
                         } else if full_stop_started {
                             translation_controller.vtol_enabled = true;
-                            translation_controller.vtol_max_tilt = Deg(75.0);
+                            translation_controller.vtol_max_tilt = descriptor.full_stop_max_tilt;
                             translation_controller.target =
                                 TranslationTarget::Velocity(vec3(0.0, 0.0, 0.0));
                         } else {
@@ -523,7 +565,7 @@ impl FlightComputer {
                         }
 
                         translation_controller.enabled = true;
-                        if !full_stop_started {
+                        if !full_stop_started && !impact_adjustment_active {
                             auto_pilot
                                 .set_target_direction((-velocity.normalize()).into())
                                 .await?;

@@ -36,7 +36,7 @@ pub fn newton_find_all_roots(
     for i in 0..step_count {
         let t = start + (end - start) * i as f64 / (step_count - 1) as f64;
         let root = newton_find_root(t, iterations, &mut function, &mut derivative);
-        if root >= start && root <= end && function(root) <= tolerance {
+        if root >= start && root <= end && function(root).abs() <= tolerance {
             roots.push(root);
         }
     }

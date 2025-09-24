@@ -4,12 +4,12 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-tokio = { version = "1.41.1", features = ["full"] }
-tokio-macros = { version = "2.4.0" }
-krpc-client = { git = "https://github.com/kladd/krpc-client.git", features = [
+tokio = { version = "1.43.0", features = ["full"] }
+tokio-macros = { version = "2.5.0" }
+krpc-client = { git = "https://github.com/angeld23/krpc-client.git", features = [
     "tokio",
 ] }
-anyhow = "1.0.93"
+anyhow = "1.0.95"
 cgmath = { version = "0.18.0", features = ["swizzle"] }
 derive_more = { version = "1.0.0", features = [
     "add",
@@ -36,6 +36,7 @@ derive_more = { version = "1.0.0", features = [
     "try_unwrap",
     "unwrap",
 ] }
-env_logger = "0.11.5"
-log = "0.4.22"
+env_logger = "0.11.6"
+log = "0.4.25"
 async-recursion = "1.1.1"
+clap = { version = "*", features = ["derive"] }

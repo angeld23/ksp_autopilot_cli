@@ -27,6 +27,7 @@ impl FlightComputer {
             .await?;
         auto_pilot.set_roll_threshold(0.0).await?;
         auto_pilot.set_target_direction((0.0, 1.0, 0.0)).await?;
+
         auto_pilot.engage().await?;
 
         self.save_control_config().await?;
@@ -117,7 +118,9 @@ impl FlightComputer {
                         TranslationTarget::Acceleration(vec3(0.0, 10.0, 0.0));
                 } else if within_margin {
                     control
-                        .set_throttle(if remaining_delta_v <= 10.0 {
+                        .set_throttle(if remaining_delta_v <= 1.0 {
+                            throttle_for_acceleration(&self.vessel, 1.0).await?
+                        } else if remaining_delta_v <= 10.0 {
                             throttle_for_acceleration(&self.vessel, 10.0).await?
                         } else {
                             1.0

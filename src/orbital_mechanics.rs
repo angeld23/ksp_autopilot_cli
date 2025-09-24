@@ -6,7 +6,7 @@ use async_recursion::async_recursion;
 use cgmath::{
     ulps_eq, vec2, vec3, Angle, InnerSpace, Quaternion, Rad, Rotation3, Vector2, Vector3,
 };
-use krpc_client::services::space_center::{CelestialBody, Control, Node, Orbit, SpaceCenter};
+use krpc_client::services::space_center::{CelestialBody, Node, Orbit, SpaceCenter, Vessel};
 
 use crate::util::flatten_vector;
 
@@ -68,7 +68,11 @@ impl LocalOrbit {
     }
 
     pub fn mean_anomaly_at_ut(&self, ut: f64) -> Rad<f64> {
-        self.mean_anomaly_at_epoch + self.mean_motion() * (ut - self.epoch)
+        let mut ma = self.mean_anomaly_at_epoch + self.mean_motion() * (ut - self.epoch);
+        if self.is_elliptical() {
+            ma = ma.normalize()
+        }
+        ma
     }
 
     pub fn period(&self) -> f64 {
@@ -84,7 +88,20 @@ impl LocalOrbit {
     }
 
     pub fn eccentric_anomaly_of_mean_anomaly(&self, mean_anomaly: Rad<f64>) -> Rad<f64> {
-        let mut guess = mean_anomaly;
+        let mean_anomaly = if self.is_elliptical() {
+            mean_anomaly.normalize()
+        } else {
+            mean_anomaly
+        };
+
+        let mut guess = if self.is_elliptical() {
+            mean_anomaly
+        } else {
+            let m = mean_anomaly.0;
+            let sign = if m >= 0.0 { 1.0 } else { -1.0 };
+            let h0 = (2.0 * m.abs() / self.eccentricity + 1.8).ln() * sign;
+            Rad(h0)
+        };
         for _ in 0..30 {
             if self.is_elliptical() {
                 guess -= (guess - Rad(self.eccentricity * guess.sin()) - mean_anomaly)
@@ -95,7 +112,11 @@ impl LocalOrbit {
             }
         }
 
-        guess
+        if self.is_elliptical() {
+            guess.normalize()
+        } else {
+            guess
+        }
     }
 
     pub fn eccentric_anomaly_at_ut(&self, ut: f64) -> Rad<f64> {
@@ -234,29 +255,23 @@ impl LocalOrbit {
             return true_anomaly;
         }
 
-        let mut guess = true_anomaly;
-        for _ in 0..30 {
-            if self.is_elliptical() {
-                guess -= Rad(
-                    (guess.sin().powi(2) / (self.eccentricity * guess.cos() - 1.0))
-                        * ((guess.cos() - self.eccentricity) / guess.sin()
-                            - self.semi_minor_axis() * true_anomaly.cos()
-                                / (self.semi_major_axis * true_anomaly.sin())),
-                )
-            } else {
-                guess -= Rad(guess.0.cosh()
-                    - (true_anomaly.cos() + self.eccentricity)
-                        / (1.0 + self.eccentricity * true_anomaly.cos()))
-                    / guess.0.sinh()
-            }
-        }
+        let ea = if self.is_elliptical() {
+            Rad(2.0
+                * (((1.0 - self.eccentricity) / (1.0 + self.eccentricity)).sqrt()
+                    * (true_anomaly / 2.0).tan())
+                .atan())
+        } else {
+            Rad(2.0
+                * (((self.eccentricity - 1.0) / (self.eccentricity + 1.0)).sqrt()
+                    * (true_anomaly / 2.0).tan())
+                .atanh())
+        };
 
-        guess
-            + if true_anomaly < Rad::full_turn() / 2.0 {
-                Rad(0.0)
-            } else {
-                -Rad::full_turn()
-            }
+        if self.is_elliptical() {
+            ea.normalize()
+        } else {
+            ea.normalize_signed()
+        }
     }
 
     pub fn mean_anomaly_of_true_anomaly(&self, true_anomaly: Rad<f64>) -> Rad<f64> {
@@ -435,6 +450,36 @@ impl LocalOrbit {
 
         self.periapsis_epoch() + self.period() * (elapsed / self.period()).floor()
     }
+
+    pub fn next_periapsis_ut(&self, current_ut: f64) -> f64 {
+        if self.is_elliptical() {
+            self.most_recent_periapsis_ut(current_ut) + self.period()
+        } else {
+            self.periapsis_epoch()
+        }
+    }
+
+    pub fn next_apoapsis_ut(&self, current_ut: f64) -> f64 {
+        if self.is_elliptical() {
+            let ut = self.most_recent_periapsis_ut(current_ut) + self.period() / 2.0;
+            if ut < current_ut {
+                ut + self.period()
+            } else {
+                ut
+            }
+        } else {
+            f64::INFINITY
+        }
+    }
+
+    pub fn after_node(&self, local_node: LocalNode) -> Self {
+        self.body.create_orbit_from_state_vectors(
+            local_node.ut,
+            self.position_at_ut(local_node.ut),
+            self.velocity_at_ut(local_node.ut)
+                + self.prograde_normal_radial_to_absolute(local_node.ut, local_node.burn_vector),
+        )
+    }
 }
 
 #[derive(Clone, PartialEq)]
@@ -442,6 +487,7 @@ pub struct LocalBody {
     pub name: String,
     pub gravitational_parameter: f64,
     pub sphere_of_influence: f64,
+    pub radius: f64,
     pub orbit: Option<LocalOrbit>,
 }
 
@@ -457,6 +503,7 @@ impl LocalBody {
             name: body.get_name().await?,
             gravitational_parameter: body.get_gravitational_parameter().await?,
             sphere_of_influence: body.get_sphere_of_influence().await?,
+            radius: body.get_equatorial_radius().await?,
             orbit: if let Some(orbit) = body.get_orbit().await? {
                 Some(LocalOrbit::from_orbit(&orbit).await?)
             } else {
@@ -481,35 +528,15 @@ impl LocalBody {
 
         let semi_major_axis = semi_latus_rectum / (1.0 - eccentricity_vector.magnitude2());
         let inclination = specific_angular_momentum.angle(vec3(0.0, 1.0, 0.0));
+
         let longitude_of_ascending_node = (ascending_node_vector.angle(vec3(1.0, 0.0, 0.0))
-            * if ascending_node_vector
-                .dot(specific_angular_momentum)
-                .is_sign_positive()
-            {
-                1.0
-            } else {
-                -1.0
-            }
-            * if eccentricity_vector.magnitude() >= 1.0 {
-                -1.0
-            } else {
-                1.0
-            })
+            * ascending_node_vector.z.signum())
         .normalize();
         let argument_of_periapsis = (ascending_node_vector.angle(eccentricity_vector)
-            * if eccentricity_vector.y.is_sign_positive() {
-                1.0
-            } else {
-                -1.0
-            })
+            * eccentricity_vector.y.signum())
         .normalize();
-        let true_anomaly_at_epoch = (eccentricity_vector.angle(position)
-            * if position.dot(velocity).is_sign_positive() {
-                1.0
-            } else {
-                -1.0
-            })
-        .normalize();
+        let true_anomaly_at_epoch =
+            eccentricity_vector.angle(position) * position.dot(velocity).signum();
 
         let mut orbit = LocalOrbit {
             body: Box::new(self.clone()),
@@ -545,9 +572,9 @@ impl LocalBody {
         } else {
             let mut earliest_closest_approach_ut: Option<f64> = None;
 
-            let cycles = (look_ahead / orbit.period()).floor() as u32;
+            let cycles = ((look_ahead / orbit.period()).max(0.1).ceil() as u32) - 1;
             'per_cycle_search: for i in 0..(cycles + 1) {
-                let cycle_look_ahead = if i == cycles {
+                let cycle_look_ahead = if i == cycles && cycles > 1 {
                     look_ahead % orbit.period()
                 } else {
                     orbit.period()
@@ -607,6 +634,10 @@ impl LocalBody {
 
     pub fn orbital_period_of_sma(&self, sma: f64) -> f64 {
         Rad::full_turn() / self.mean_motion_of_sma(sma)
+    }
+
+    pub fn sma_of_orbital_period(&self, period: f64) -> f64 {
+        ((period.powi(2) * self.gravitational_parameter) / TAU.powi(2)).cbrt()
     }
 }
 
@@ -670,19 +701,21 @@ impl OrbitalTrajectory {
             .retain(|state_change| state_change.ut <= latest_ut);
     }
 
-    pub async fn add_node(&mut self, node: &Node) -> Result<()> {
-        let ut = node.get_ut().await?;
-        let orbit = self.orbit_at_ut(ut);
+    pub fn add_local_node(&mut self, local_node: LocalNode) {
+        let orbit = self.orbit_at_ut(local_node.ut);
 
-        self.prune(ut);
+        self.prune(local_node.ut);
         self.state_changes.push(OrbitalStateChange {
             body: Box::into_inner(orbit.body.clone()),
-            ut,
-            position: orbit.position_at_ut(ut),
-            velocity: orbit.velocity_at_ut(ut)
-                + orbit
-                    .prograde_normal_radial_to_absolute(ut, node.burn_vector(None).await?.into()),
+            ut: local_node.ut,
+            position: orbit.position_at_ut(local_node.ut),
+            velocity: orbit.velocity_at_ut(local_node.ut)
+                + orbit.prograde_normal_radial_to_absolute(local_node.ut, local_node.burn_vector),
         });
+    }
+
+    pub async fn add_node(&mut self, node: &Node) -> Result<()> {
+        self.add_local_node(LocalNode::from_node(node).await?);
 
         Ok(())
     }
@@ -702,16 +735,26 @@ impl LocalNode {
         })
     }
 
-    pub async fn add(&self, control: &Control) -> Result<()> {
-        control
+    pub async fn from_all_nodes(vessel: &Vessel) -> Result<Vec<Self>> {
+        let nodes = vessel.get_control().await?.get_nodes().await?;
+        let mut local_nodes = Vec::<Self>::with_capacity(nodes.len());
+        for node in nodes {
+            local_nodes.push(Self::from_node(&node).await?);
+        }
+        Ok(local_nodes)
+    }
+
+    pub async fn to_node(self, vessel: &Vessel) -> Result<Node> {
+        Ok(vessel
+            .get_control()
+            .await?
             .add_node(
                 self.ut,
                 self.burn_vector.x as f32,
                 self.burn_vector.y as f32,
                 self.burn_vector.z as f32,
             )
-            .await?;
-        Ok(())
+            .await?)
     }
 }
 

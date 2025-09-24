@@ -1,81 +1,55 @@
-use anyhow::{anyhow, bail, Result};
-use cgmath::{num_traits::Signed, Angle, Deg, InnerSpace, Quaternion, Rad, Vector3};
+use cgmath::{vec2, vec3, Angle, Deg, InnerSpace, Quaternion, Rad, Vector3};
 use derive_more::*;
-use krpc_client::services::space_center::{Node, Vessel};
-use log::debug;
 
 use crate::{
-    orbital_mechanics::{LocalBody, LocalOrbit, OrbitalStateChange, OrbitalTrajectory},
-    util::{get_current_ut_from_orbit, get_relative_ascending_node_direction},
+    orbital_mechanics::{LocalBody, LocalNode, LocalOrbit},
+    util::get_relative_ascending_node_direction,
 };
 
-pub async fn node_change_velocity(
-    vessel: &Vessel,
-    ut: f64,
-    velocity: Vector3<f64>,
-) -> Result<Node> {
-    let control = vessel.get_control().await?;
-    let orbit = LocalOrbit::from_orbit(&vessel.get_orbit().await?).await?;
-    let pnr = orbit.absolute_to_prograde_normal_radial(ut, velocity - orbit.velocity_at_ut(ut));
-
-    Ok(control
-        .add_node(ut, pnr.x as f32, pnr.y as f32, pnr.z as f32)
-        .await?)
+pub fn node_change_velocity(orbit: &LocalOrbit, ut: f64, velocity: Vector3<f64>) -> LocalNode {
+    LocalNode {
+        ut,
+        burn_vector: orbit
+            .absolute_to_prograde_normal_radial(ut, velocity - orbit.velocity_at_ut(ut)),
+    }
 }
 
-pub async fn node_change_speed(vessel: &Vessel, ut: f64, speed: f64) -> Result<Node> {
-    let control = vessel.get_control().await?;
-    let orbit = LocalOrbit::from_orbit(&vessel.get_orbit().await?).await?;
-
-    Ok(control
-        .add_node(
-            ut,
-            (speed - orbit.velocity_at_ut(ut).magnitude()) as f32,
-            0.0,
-            0.0,
-        )
-        .await?)
+pub fn node_change_speed(orbit: &LocalOrbit, ut: f64, speed: f64) -> LocalNode {
+    LocalNode {
+        ut,
+        burn_vector: vec3(speed - orbit.velocity_at_ut(ut).magnitude(), 0.0, 0.0),
+    }
 }
 
-pub async fn node_circularize(vessel: &Vessel, ut: f64) -> Result<Node> {
-    let orbit = LocalOrbit::from_orbit(&vessel.get_orbit().await?).await?;
-
+pub fn node_circularize(orbit: &LocalOrbit, ut: f64) -> LocalNode {
     let position = orbit.position_at_ut(ut);
     let circular_speed = orbit.body.circular_orbit_speed(position.magnitude());
     let velocity = position.cross(orbit.normal()).normalize_to(circular_speed);
 
-    node_change_velocity(vessel, ut, velocity).await
+    node_change_velocity(orbit, ut, velocity)
 }
 
-pub async fn node_circularize_at_apsis(vessel: &Vessel, is_periapsis: bool) -> Result<Node> {
-    let non_local_orbit = vessel.get_orbit().await?;
-    let orbit = LocalOrbit::from_orbit(&non_local_orbit).await?;
-    let current_ut = get_current_ut_from_orbit(&non_local_orbit).await?;
-
-    let apsis_ut = orbit.most_recent_periapsis_ut(current_ut)
-        + if is_periapsis {
-            0.0
+pub fn node_circularize_at_apsis(
+    orbit: &LocalOrbit,
+    is_periapsis: bool,
+    current_ut: f64,
+) -> LocalNode {
+    node_circularize(
+        orbit,
+        if is_periapsis {
+            orbit.next_periapsis_ut(current_ut)
         } else {
-            orbit.period() / 2.0
-        };
-    let ut = if apsis_ut < current_ut {
-        apsis_ut + orbit.period()
-    } else {
-        apsis_ut
-    };
-
-    node_circularize(vessel, ut).await
+            orbit.next_apoapsis_ut(current_ut)
+        },
+    )
 }
 
-pub async fn node_change_orbit_normal(
-    vessel: &Vessel,
+pub fn node_change_orbit_normal(
+    orbit: &LocalOrbit,
     target_orbit_normal: Vector3<f64>,
     save_fuel: bool,
-) -> Result<Node> {
-    let non_local_orbit = vessel.get_orbit().await?;
-    let current_ut = get_current_ut_from_orbit(&non_local_orbit).await?;
-    let orbit = LocalOrbit::from_orbit(&non_local_orbit).await?;
-
+    current_ut: f64,
+) -> LocalNode {
     let periapsis_ut = orbit.most_recent_periapsis_ut(current_ut);
     let ascending_direction =
         get_relative_ascending_node_direction(orbit.normal(), target_orbit_normal);
@@ -109,38 +83,29 @@ pub async fn node_change_orbit_normal(
     };
 
     let rotation = Quaternion::from_arc(orbit.normal(), target_orbit_normal, None);
-    node_change_velocity(vessel, ut, rotation * orbit.velocity_at_ut(ut)).await
+    node_change_velocity(orbit, ut, rotation * orbit.velocity_at_ut(ut))
 }
 
-pub async fn node_change_opposite_radius(
-    vessel: &Vessel,
-    target_radius: f64,
-    ut: f64,
-) -> Result<Node> {
-    let orbit = LocalOrbit::from_orbit(&vessel.get_orbit().await?).await?;
-
+pub fn node_change_opposite_radius(orbit: &LocalOrbit, target_radius: f64, ut: f64) -> LocalNode {
     let position = orbit.position_at_ut(ut);
     let radius = position.magnitude();
     let target_sma = (radius + target_radius) / 2.0;
 
     node_change_speed(
-        vessel,
+        orbit,
         ut,
         orbit
             .body
             .orbital_speed_from_sma_and_radius(target_sma, radius),
     )
-    .await
 }
 
-pub async fn node_hohmann_transfer(
-    vessel: &Vessel,
+pub fn node_hohmann_transfer(
+    orbit: &LocalOrbit,
     target_orbit: &LocalOrbit,
     offset: f64,
-) -> Result<Node> {
-    let non_local_orbit = vessel.get_orbit().await?;
-    let orbit = LocalOrbit::from_orbit(&non_local_orbit).await?;
-    let current_ut = get_current_ut_from_orbit(&non_local_orbit).await?;
+    current_ut: f64,
+) -> LocalNode {
     let current_true_anomaly = orbit.true_anomaly_at_ut(current_ut);
 
     let get_guess_error = |guess: Rad<f64>| {
@@ -182,7 +147,7 @@ pub async fn node_hohmann_transfer(
         guess = if next_guess >= min_guess {
             next_guess
         } else {
-            guess + (Rad::full_turn() - guess_error) / derivative
+            (guess - (Rad::full_turn() - guess_error) / -derivative).normalize()
         };
 
         if guess_error.0.abs() < best_guess_error.0.abs() {
@@ -201,103 +166,291 @@ pub async fn node_hohmann_transfer(
         + target_orbit.true_anomaly_time_delay(target_ideal_true_anomaly);
     let target_ideal_intercept_position = target_orbit.position_at_ut(target_ideal_ut);
 
-    debug!(
-        "hohmann transfer:\n\tbest guess = {:?}\n\terr = {:?}",
-        Deg::from(best_guess),
-        Deg::from(best_guess_error)
-    );
-
-    node_change_opposite_radius(vessel, target_ideal_intercept_position.magnitude(), ut).await
+    node_change_opposite_radius(orbit, target_ideal_intercept_position.magnitude(), ut)
 }
 
-pub async fn node_hohmann_transfer_to_body(
-    vessel: &Vessel,
-    target_body: &LocalBody,
-    periapsis: f64,
-) -> Result<Node> {
-    let non_local_orbit = vessel.get_orbit().await?;
-    let orbit = LocalOrbit::from_orbit(&non_local_orbit).await?;
-    let target_orbit = target_body
-        .orbit
-        .as_ref()
-        .ok_or(anyhow!("target body has no orbit"))?;
+pub fn node_tune_closest_approach(
+    orbit: &LocalOrbit,
+    target_orbit: &LocalOrbit,
+    ut: f64,
+    desired_distance: f64,
+    search_radius: f64,
+) -> LocalNode {
+    let search_radius = search_radius.max(0.1);
 
-    if orbit.body.name != target_orbit.body.name {
-        bail!("parent bodies do not match")
+    // this needs to be an odd number so that a speed change of 0 is always included in at least the initial search
+    let increments = 15;
+
+    let mut start = -search_radius;
+    let mut end = search_radius;
+
+    let mut closest_speed_change = 0.0;
+    let mut closest_distance_error = f64::INFINITY;
+
+    for _ in 0..10 {
+        let step_size = (end - start) / (increments - 1) as f64;
+
+        for i in 0..increments {
+            let speed_change = start + i as f64 * step_size;
+            let changed_orbit = orbit.body.create_orbit_from_state_vectors(
+                ut,
+                orbit.position_at_ut(ut),
+                orbit
+                    .velocity_at_ut(ut)
+                    .normalize_to(orbit.velocity_at_ut(ut).magnitude() + speed_change),
+            );
+            let (_, approach_distance) =
+                changed_orbit.find_closest_approach(target_orbit, ut, changed_orbit.period());
+            let distance_error = (approach_distance - desired_distance).abs();
+
+            if distance_error < closest_distance_error {
+                closest_distance_error = distance_error;
+                closest_speed_change = speed_change;
+            }
+        }
+
+        start = closest_speed_change - step_size;
+        end = closest_speed_change + step_size;
     }
 
-    let node = node_hohmann_transfer(vessel, target_orbit, 0.0).await?;
-    let node_ut = node.get_ut().await?;
-    let node_delta_v = node.get_delta_v().await?;
-    let current_ut = get_current_ut_from_orbit(&non_local_orbit).await?;
+    LocalNode {
+        ut,
+        burn_vector: vec3(closest_speed_change, 0.0, 0.0),
+    }
+}
 
-    let mut trajectory = orbit.singleton_trajectory(current_ut);
-    trajectory.add_node(&node).await?;
+pub fn node_tune_body_periapsis(
+    orbit: &LocalOrbit,
+    target_body: &LocalBody,
+    ut: f64,
+    desired_periapsis: f64,
+    search_radius: f64,
+) -> LocalNode {
+    let search_radius = search_radius.max(0.1);
 
-    let burn_direction = orbit
-        .prograde_normal_radial_to_absolute(node_ut, node.burn_vector(None).await?.into())
-        .normalize();
-    let position = orbit.position_at_ut(node_ut);
-    let velocity = orbit.velocity_at_ut(node_ut);
+    let target_orbit = target_body.orbit.as_ref().unwrap();
+    // this needs to be an odd number so that a speed change of 0 is always included in at least the initial search
+    let increments = 11;
 
-    let mut start = node_delta_v - 100.0;
-    let mut end = node_delta_v + 100.0;
-    for _ in 0..30 {
-        let middle = (start + end) / 2.0;
-        let transfer_orbit = orbit.body.create_orbit_from_state_vectors(
-            node_ut,
-            position,
-            velocity + burn_direction * middle,
-        );
+    let mut start = -search_radius;
+    let mut end = search_radius;
 
-        let middle_periapsis = if let Some(enter_ut) =
-            target_body.find_soi_enter(&transfer_orbit, node_ut, transfer_orbit.period())
-        {
-            let enter_position =
-                transfer_orbit.position_at_ut(enter_ut) - target_orbit.position_at_ut(enter_ut);
-            let enter_velocity =
-                transfer_orbit.velocity_at_ut(enter_ut) - target_orbit.velocity_at_ut(enter_ut);
-            let enter_orbit = target_body.create_orbit_from_state_vectors(
-                enter_ut,
-                enter_position,
-                enter_velocity,
+    let mut closest_speed_change = 0.0;
+    let mut closest_distance_error = f64::INFINITY;
+
+    for _ in 0..7 {
+        let step_size = (end - start) / (increments - 1) as f64;
+
+        for i in 0..increments {
+            let speed_change = start + i as f64 * step_size;
+
+            let changed_orbit = orbit.body.create_orbit_from_state_vectors(
+                ut,
+                orbit.position_at_ut(ut),
+                orbit
+                    .velocity_at_ut(ut)
+                    .normalize_to(orbit.velocity_at_ut(ut).magnitude() + speed_change),
             );
 
-            if enter_orbit
-                .normal()
-                .dot(target_orbit.normal())
-                .is_sign_positive()
+            if let Some(enter_ut) =
+                target_body.find_soi_enter(&changed_orbit, ut, changed_orbit.period())
             {
-                enter_orbit.periapsis()
-            } else {
-                -enter_orbit.periapsis()
+                let position =
+                    changed_orbit.position_at_ut(enter_ut) - target_orbit.position_at_ut(enter_ut);
+                let velocity =
+                    changed_orbit.velocity_at_ut(enter_ut) - target_orbit.velocity_at_ut(enter_ut);
+
+                let enter_orbit =
+                    target_body.create_orbit_from_state_vectors(enter_ut, position, velocity);
+
+                let periapsis = enter_orbit.periapsis()
+                    * enter_orbit.normal().dot(changed_orbit.normal()).signum();
+                let distance_error = (periapsis - desired_periapsis).abs();
+
+                if distance_error < closest_distance_error {
+                    closest_distance_error = distance_error;
+                    closest_speed_change = speed_change;
+                }
             }
-        } else {
-            let (approach_ut, approach_distance) = transfer_orbit.find_closest_approach(
-                target_orbit,
-                node_ut,
-                transfer_orbit.period() / 2.0,
+        }
+
+        start = closest_speed_change - step_size;
+        end = closest_speed_change + step_size;
+    }
+
+    LocalNode {
+        ut,
+        burn_vector: vec3(closest_speed_change, 0.0, 0.0),
+    }
+}
+
+pub fn node_hohmann_transfer_to_body(
+    orbit: &LocalOrbit,
+    target_body: &LocalBody,
+    desired_periapsis: f64,
+    current_ut: f64,
+) -> LocalNode {
+    let target_orbit = target_body.orbit.as_ref().unwrap();
+    let node = node_hohmann_transfer(orbit, target_orbit, 0.0, current_ut);
+    let transfer_orbit = orbit.after_node(node);
+    let tune_node = node_tune_body_periapsis(
+        &transfer_orbit,
+        target_body,
+        node.ut,
+        desired_periapsis,
+        node.burn_vector.magnitude() / 2.0,
+    );
+
+    LocalNode {
+        ut: node.ut,
+        burn_vector: node.burn_vector + tune_node.burn_vector,
+    }
+}
+
+pub fn node_return_to_parent_body(
+    orbit: &LocalOrbit,
+    desired_periapsis: f64,
+    current_ut: f64,
+) -> LocalNode {
+    assert!(
+        orbit.body.orbit.is_some(),
+        "no parent body exists, you are probably orbiting the sun"
+    );
+    let child_orbit = orbit.body.orbit.as_ref().unwrap();
+    let parent_body = &child_orbit.body;
+
+    // step 1: find a node that's pretty close (but not precise)
+    // i tried to make this the only step, but oh well
+
+    let step_count = 360;
+    let iterations = 5;
+
+    let mut start = Rad(0.0);
+    let mut end = Rad::full_turn();
+    let mut exit_ut = current_ut + orbit.period() * 2.0;
+
+    let mut best_difference = f64::INFINITY;
+    let mut best_exit_orbit = orbit.clone();
+    let mut best_exit_burn_ut = current_ut;
+    let mut best_angle = Rad(0.0);
+
+    for iteration in 0..iterations {
+        let angle_step = (end - start) / step_count as f64;
+
+        for step in 0..step_count {
+            let angle = start + angle_step * step as f64;
+
+            let exit_position = orbit.local_to_absolute_vector(
+                vec2(angle.cos(), angle.sin()) * orbit.body.sphere_of_influence,
             );
+            let exit_parent_position = child_orbit.position_at_ut(exit_ut) + exit_position;
 
-            if transfer_orbit.position_at_ut(approach_ut).magnitude()
-                > target_orbit.position_at_ut(approach_ut).magnitude()
-            {
-                -approach_distance
-            } else {
-                approach_distance
+            let exit_parent_velocity = exit_parent_position
+                .cross(child_orbit.normal())
+                .normalize_to(parent_body.orbital_speed_from_sma_and_radius(
+                    (desired_periapsis + exit_parent_position.magnitude()) / 2.0,
+                    exit_parent_position.magnitude(),
+                ));
+
+            let exit_velocity = exit_parent_velocity - child_orbit.velocity_at_ut(exit_ut);
+            if exit_velocity.dot(exit_position).is_sign_negative() {
+                continue;
             }
-        };
 
-        println!("hdfgdfs {}", middle_periapsis);
+            let exit_orbit =
+                orbit
+                    .body
+                    .create_orbit_from_state_vectors(exit_ut, exit_position, exit_velocity);
+            let exit_periapsis_position = exit_orbit.periapsis_direction() * exit_orbit.periapsis();
 
-        if middle_periapsis > periapsis {
-            start = middle;
-        } else {
-            end = middle;
+            let exit_burn_ut = orbit.most_recent_periapsis_ut(current_ut)
+                + orbit.true_anomaly_time_delay(
+                    orbit.true_anomaly_of_position(exit_periapsis_position),
+                );
+            let exit_burn_ut = if exit_burn_ut < current_ut {
+                exit_burn_ut + orbit.period()
+            } else {
+                exit_burn_ut
+            };
+
+            if exit_orbit
+                .velocity_at_ut(exit_orbit.periapsis_epoch())
+                .dot(orbit.velocity_at_ut(exit_burn_ut))
+                .is_sign_negative()
+            {
+                continue;
+            }
+
+            let difference =
+                (exit_periapsis_position - orbit.position_at_ut(exit_burn_ut)).magnitude();
+            if difference < best_difference {
+                best_difference = difference;
+                best_exit_orbit = exit_orbit;
+                best_exit_burn_ut = exit_burn_ut;
+                best_angle = angle;
+            }
+        }
+
+        let best_exit_orbit_time_difference =
+            best_exit_orbit.most_recent_periapsis_ut(exit_ut) - best_exit_burn_ut;
+        exit_ut -= best_exit_orbit_time_difference;
+
+        // let the first iteration find a more accurate exit_ut before we shrink the area down
+        if iteration >= 1 {
+            start += (best_angle - start) / 2.0;
+            end += (best_angle - end) / 2.0;
         }
     }
 
-    node.set_delta_v((start + end) / 2.0).await?;
+    // step 2: adjust burn until the periapsis is precise
+    // not as elegant as i would have liked, but it works perfectly
 
-    Ok(node)
+    let new_speed = best_exit_orbit
+        .velocity_at_ut(best_exit_orbit.periapsis_epoch())
+        .magnitude();
+    let current_speed_change = new_speed - orbit.velocity_at_ut(best_exit_burn_ut).magnitude();
+
+    let search_radius = current_speed_change / 2.0;
+    let burn_adjust_increments = 15;
+
+    let mut start = current_speed_change - search_radius;
+    let mut end = current_speed_change + search_radius;
+
+    let mut best_speed_change = current_speed_change;
+    let mut best_difference = f64::INFINITY;
+    for _ in 0..10 {
+        let step_size = (end - start) / (burn_adjust_increments - 1) as f64;
+
+        for i in 0..burn_adjust_increments {
+            let speed_change = start + i as f64 * step_size;
+            let changed_orbit = orbit.after_node(LocalNode {
+                ut: best_exit_burn_ut,
+                burn_vector: vec3(speed_change, 0.0, 0.0),
+            });
+
+            if let Some(adjusted_exit_ut) = changed_orbit.find_soi_exit(best_exit_burn_ut) {
+                let adjusted_parent_exit_orbit = parent_body.create_orbit_from_state_vectors(
+                    adjusted_exit_ut,
+                    child_orbit.position_at_ut(adjusted_exit_ut)
+                        + changed_orbit.position_at_ut(adjusted_exit_ut),
+                    child_orbit.velocity_at_ut(adjusted_exit_ut)
+                        + changed_orbit.velocity_at_ut(adjusted_exit_ut),
+                );
+                let adjusted_periapsis = adjusted_parent_exit_orbit.periapsis();
+                let difference = (adjusted_periapsis - desired_periapsis).abs();
+                if difference < best_difference {
+                    best_speed_change = speed_change;
+                    best_difference = difference;
+                }
+            }
+        }
+
+        start = best_speed_change - step_size;
+        end = best_speed_change + step_size;
+    }
+
+    LocalNode {
+        ut: best_exit_burn_ut,
+        burn_vector: vec3(best_speed_change, 0.0, 0.0),
+    }
 }

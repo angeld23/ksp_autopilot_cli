@@ -4,10 +4,7 @@ use krpc_client::services::space_center::Vessel;
 
 use crate::{
     numerical_integration::runge_kutta_step,
-    util::{
-        get_current_ut_from_orbit, get_thrust_info, height_above_surface_at_position,
-        surface_acceleration, ThrustInfo,
-    },
+    util::{apparent_acceleration, get_current_ut_from_orbit, height_above_surface_at_position},
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -142,13 +139,22 @@ impl SurfaceTrajectory {
                 first_value + t * (second_value - first_value)
             };
 
-            let g_acceleration = surface_acceleration(mu, angular_velocity, prev_keyframe.position);
+            let g_acceleration = apparent_acceleration(
+                mu,
+                angular_velocity,
+                prev_keyframe.position,
+                prev_keyframe.velocity,
+            );
 
-            let rotated_aero_base_vector = Quaternion::from_arc(
-                vec3(0.0, 1.0, 0.0),
-                prev_keyframe.velocity.normalize(),
-                None,
-            ) * aero_base_vector;
+            let rotated_aero_base_vector = if prev_keyframe.velocity.is_zero() {
+                vec3(0.0, 0.0, 0.0)
+            } else {
+                Quaternion::from_arc(
+                    vec3(0.0, 1.0, 0.0),
+                    prev_keyframe.velocity.normalize(),
+                    None,
+                ) * aero_base_vector
+            };
 
             let acceleration = |_: f64, velocity: Vector3<f64>| {
                 g_acceleration
@@ -160,15 +166,15 @@ impl SurfaceTrajectory {
             let expected_position = prev_keyframe.position
                 + time_step * (prev_keyframe.velocity + expected_velocity) / 2.0;
 
-            if expected_position.magnitude() - radius < -3000.0 {
-                break 'predict_steps;
-            }
-
             keyframes.push(SurfaceTrajectoryKeyframe {
                 ut,
                 position: expected_position,
                 velocity: expected_velocity,
             });
+
+            if expected_position.magnitude() - radius < -3000.0 {
+                break 'predict_steps;
+            }
         }
 
         let mut impact: Option<SurfaceTrajectoryKeyframe> = None;

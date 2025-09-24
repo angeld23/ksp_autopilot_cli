@@ -6,6 +6,7 @@ use crate::translation::TranslationController;
 use anyhow::Result;
 use krpc_client::services::{
     drawing::Drawing,
+    mech_jeb::MechJeb,
     space_center::{SpaceCenter, Vessel, VesselSituation},
 };
 use tokio::{sync::Mutex, time};
@@ -18,6 +19,7 @@ pub struct ControlConfig {
 
 pub struct FlightComputer {
     pub space_center: Arc<SpaceCenter>,
+    pub mech: Arc<MechJeb>,
     pub drawing: Arc<Drawing>,
     pub local_universe: LocalUniverse,
     pub vessel: Vessel,
@@ -110,6 +112,8 @@ impl FlightComputer {
         let auto_pilot = self.vessel.get_auto_pilot().await?;
 
         auto_pilot.set_reference_frame(&reference_frame).await?;
+        auto_pilot.set_target_roll(f32::NAN).await?;
+        auto_pilot.set_attenuation_angle((1.0, 1.0, 1.0)).await?;
         auto_pilot.disengage().await?;
         control.set_throttle(0.0).await?;
 

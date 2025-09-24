@@ -8,7 +8,11 @@ use krpc_client::services::space_center::ReferenceFrame;
 use log::debug;
 use tokio::time;
 
-use crate::{maneuver::node_circularize, util::get_orbit_normal, FlightComputer};
+use crate::{
+    maneuver::node_circularize,
+    util::{get_orbit_normal, vessel_local_orbit},
+    FlightComputer,
+};
 
 #[derive(IsVariant, Unwrap)]
 pub enum InclinationTarget {
@@ -28,6 +32,7 @@ pub struct AscentDescriptor {
     pub inclination_target: InclinationTarget,
     pub max_prograde_error: Deg<f64>,
     pub circularize: bool,
+    pub do_atmosphere_warp: bool,
     pub correct_lobsided_orbit: bool,
 }
 
@@ -39,6 +44,7 @@ impl Default for AscentDescriptor {
             inclination_target: Default::default(),
             max_prograde_error: Deg(15.0),
             circularize: true,
+            do_atmosphere_warp: true,
             correct_lobsided_orbit: true,
         }
     }
@@ -112,7 +118,7 @@ impl FlightComputer {
         auto_pilot
             .set_reference_frame(&body_reference_frame)
             .await?;
-        auto_pilot.set_roll_threshold(0.0).await?;
+        auto_pilot.set_target_roll(f32::NAN).await?;
         auto_pilot.engage().await?;
 
         let mut atmosphere_warp_active = false;
@@ -120,6 +126,16 @@ impl FlightComputer {
         let mut interval = time::interval(Duration::from_secs_f64(1.0 / 20.0));
         loop {
             interval.tick().await;
+
+            let body_orbit_normal: Vector3<f64> = self
+                .space_center
+                .transform_direction(
+                    orbit_normal.into(),
+                    &non_rotating_reference_frame,
+                    &body_reference_frame,
+                )
+                .await?
+                .into();
 
             let position: Vector3<f64> = self.vessel.position(&body_reference_frame).await?.into();
             let rotation: Quaternion<f64> = flight.get_rotation().await?.into();
@@ -180,7 +196,10 @@ impl FlightComputer {
             control.set_throttle(throttle as f32).await?;
 
             if apoapsis >= descriptor.altitude {
-                if !atmosphere_warp_active && altitude <= atmosphere_height {
+                if !atmosphere_warp_active
+                    && altitude <= atmosphere_height
+                    && descriptor.do_atmosphere_warp
+                {
                     atmosphere_warp_active = true;
                     self.space_center.set_physics_warp_factor(3).await?;
                 } else if atmosphere_warp_active && altitude > atmosphere_height {
@@ -204,8 +223,15 @@ impl FlightComputer {
             let ut = self.space_center.get_ut().await?;
             let time_to_apoapsis = orbit.get_time_to_apoapsis().await?;
 
-            self.execute_node(&node_circularize(&self.vessel, ut + time_to_apoapsis).await?)
-                .await?;
+            self.execute_node(
+                &node_circularize(
+                    &vessel_local_orbit(&self.vessel).await?,
+                    ut + time_to_apoapsis,
+                )
+                .to_node(&self.vessel)
+                .await?,
+            )
+            .await?;
 
             if descriptor.correct_lobsided_orbit {
                 let apoapsis = orbit.get_apoapsis_altitude().await?;
@@ -214,8 +240,12 @@ impl FlightComputer {
                 if (apoapsis - periapsis).abs() > 500.0 {
                     debug!("|apo - peri| > 500. correcting lobsided orbit...");
                     self.execute_node(
-                        &node_circularize(&self.vessel, self.space_center.get_ut().await? + 30.0)
-                            .await?,
+                        &node_circularize(
+                            &vessel_local_orbit(&self.vessel).await?,
+                            self.space_center.get_ut().await? + 30.0,
+                        )
+                        .to_node(&self.vessel)
+                        .await?,
                     )
                     .await?;
                 }

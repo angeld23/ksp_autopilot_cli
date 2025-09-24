@@ -111,7 +111,7 @@ impl TranslationController {
 
             let auto_pilot = vessel.get_auto_pilot().await?;
             auto_pilot.set_reference_frame(reference_frame).await?;
-            auto_pilot.set_roll_threshold(0.0).await?;
+            auto_pilot.set_target_roll(f32::NAN).await?;
             auto_pilot.engage().await?;
 
             let body = vessel.get_orbit().await?.get_body().await?;
@@ -225,6 +225,14 @@ impl TranslationController {
         control.set_up(throttle.dot(up_direction) as f32).await?;
 
         Ok(())
+    }
+
+    pub fn reset_target(&mut self) {
+        self.target = TranslationTarget::Acceleration(Vector3::zero());
+    }
+
+    pub fn target_is_reset(&self) -> bool {
+        self.target == TranslationTarget::Acceleration(Vector3::zero())
     }
 
     pub async fn reset(&mut self, vessel: &Vessel) -> Result<()> {
