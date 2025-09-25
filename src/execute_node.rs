@@ -31,6 +31,7 @@ impl FlightComputer {
         auto_pilot.engage().await?;
 
         self.save_control_config().await?;
+        let saved_control_config = self.saved_control_config.lock().await.unwrap();
 
         let mut within_margin = false;
         let enter_margin_threshold: Rad<f64> = Deg(1.0).into();
@@ -86,30 +87,32 @@ impl FlightComputer {
                     .await?;
             }
 
+            let mass = self.vessel.get_mass().await? as f64;
             let remaining_delta_v = node.get_remaining_delta_v().await?;
+            let time_to_node = node.get_time_to().await?;
+            let burn_started = time_to_node <= burn_info.burn_time / 2.0;
+
             let try_rcs = self.execute_node_use_rcs && remaining_delta_v <= 1.0;
-            if try_rcs {
+            if try_rcs && !saved_control_config.rcs {
                 control.set_rcs(true).await?;
             }
-
             let rcs_force = get_translation_force(
                 &self.vessel,
                 vec3(0.0, 1.0, 0.0),
                 Some(&node_reference_frame),
             )
             .await?;
+            if !saved_control_config.rcs && !burn_started {
+                control.set_rcs(false).await?;
+            }
 
-            let mass = self.vessel.get_mass().await? as f64;
             let rcs_burn_time = remaining_delta_v / (rcs_force / mass);
             let should_use_rcs = try_rcs && rcs_burn_time < 1.0;
-
-            let time_to_node = node.get_time_to().await?;
-            let burn_started = time_to_node <= burn_info.burn_time / 2.0;
 
             if burn_started {
                 if should_use_rcs {
                     control.set_throttle(0.0).await?;
-
+                    control.set_rcs(true).await?;
                     translation_controller.enabled = true;
                     translation_controller.rcs_enabled = true;
                     translation_controller.reference_frame =
