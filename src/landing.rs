@@ -491,6 +491,7 @@ impl FlightComputer {
 
                         if full_stop_complete {
                             translation_controller.vtol_enabled = true;
+
                             if impact_error.magnitude() <= margin {
                                 if !final_hop_complete {
                                     debug!("final hop complete");

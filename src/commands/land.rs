@@ -47,7 +47,7 @@ pub struct LandArgs {
     #[clap(long, short)]
     margin: Option<f64>,
     /// The height above the ground to hover at before the final descent.
-    #[clap(long, short, default_value_t = 30.0)]
+    #[clap(long, short = 'H', default_value_t = 30.0)]
     hover_height: f64,
     /// The final speed that the vessel should be descending at when touching down.
     #[clap(long, short, default_value_t = 1.0)]
