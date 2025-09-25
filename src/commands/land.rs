@@ -81,7 +81,7 @@ pub struct LandArgs {
     #[clap(long, short = 'a', default_value_t = 500.0)]
     max_hover_approach_speed: f64,
     /// The maximum speed that is considered stationary.
-    #[clap(long, short = 's')]
+    #[clap(long, short = 's', default_value_t = 0.25)]
     max_stopped_velocity: f64,
     /// Whether to precisely adjust the impact point after deorbiting. If not provided, this is enabled unless the landing point was
     /// decided automatically.
