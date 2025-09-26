@@ -13,7 +13,7 @@ use commands::{
     dock::{dock_command, DockArgs},
     execute_node::execute_node_command,
     land::{land_command, LandArgs},
-    rendevous::{rendevous_command, RendevousArgs},
+    rendezvous::{rendezvous_command, RendezvousArgs},
     return_to_parent::{return_to_parent_command, ReturnToParentArgs},
     transfer::{transfer_command, TransferArgs},
     tune_closest_approach::{tune_closest_approach_command, TuneClosestApproachArgs},
@@ -38,7 +38,7 @@ mod landing;
 mod maneuver;
 mod numerical_integration;
 mod orbital_mechanics;
-mod rendevous;
+mod rendezvous;
 mod root_finding;
 mod trajectory_prediction;
 mod translation;
@@ -70,8 +70,8 @@ enum Command {
     Land(LandArgs),
     /// Creates a node to circularize an orbit (or change the opposite side's altitude to any other arbitrary value).
     Circularize(CircularizeArgs),
-    /// Performs a rendevous to intercept with another vessel orbiting the same body.
-    Rendevous(RendevousArgs),
+    /// Performs a rendezvous to intercept with another vessel orbiting the same body.
+    Rendezvous(RendezvousArgs),
     /// Automatically docks to another vessel.
     Dock(DockArgs),
 
@@ -124,7 +124,7 @@ async fn main() -> Result<()> {
                 Command::ReturnToParent(args) => return_to_parent_command(&computer, &args).await?,
                 Command::Land(args) => land_command(&computer, &args).await?,
                 Command::Circularize(args) => circularize_command(&computer, &args).await?,
-                Command::Rendevous(args) => rendevous_command(&computer, &args).await?,
+                Command::Rendezvous(args) => rendezvous_command(&computer, &args).await?,
                 Command::Dock(args) => dock_command(&computer, &args).await?,
                 // scripts
                 Command::Bsfp(args) => bsfp_command(&computer, &args).await?,

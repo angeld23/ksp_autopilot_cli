@@ -4,7 +4,7 @@ pub mod circularize;
 pub mod dock;
 pub mod execute_node;
 pub mod land;
-pub mod rendevous;
+pub mod rendezvous;
 pub mod return_to_parent;
 pub mod transfer;
 pub mod tune_closest_approach;

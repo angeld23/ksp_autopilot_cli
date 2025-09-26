@@ -12,14 +12,14 @@ use crate::{
 };
 
 #[derive(Debug, Clone, Copy)]
-pub struct RendevousDescriptor {
+pub struct RendezvousDescriptor {
     pub max_orbits: f64,
     pub distance: f64,
     pub tune_closest_approach: bool,
     pub match_velocity: bool,
 }
 
-impl Default for RendevousDescriptor {
+impl Default for RendezvousDescriptor {
     fn default() -> Self {
         Self {
             max_orbits: 5.0,
@@ -31,15 +31,15 @@ impl Default for RendevousDescriptor {
 }
 
 impl FlightComputer {
-    pub async fn rendevous(
+    pub async fn rendezvous(
         &self,
         target_orbit: &LocalOrbit,
-        descriptor: RendevousDescriptor,
+        descriptor: RendezvousDescriptor,
     ) -> Result<()> {
         let non_local_orbit = self.vessel.get_orbit().await?;
         let mut orbit = LocalOrbit::from_orbit(&non_local_orbit).await?;
 
-        let RendevousDescriptor {
+        let RendezvousDescriptor {
             max_orbits,
             distance,
             tune_closest_approach,
@@ -47,7 +47,7 @@ impl FlightComputer {
         } = descriptor;
         let max_orbits = max_orbits.max(1.0);
 
-        debug!("beginning rendevous sequence...");
+        debug!("beginning rendezvous sequence...");
 
         let max_angle = Rad::from(Deg(0.25));
         if orbit.normal().angle(target_orbit.normal()) > max_angle {
@@ -74,7 +74,7 @@ impl FlightComputer {
         let node = if initial_orbits_after_periapsis <= max_orbits {
             initial_node
         } else {
-            debug!("current rendevous transfer would be in {:.1} orbit(s), which is above the provided maximum of {:.1}. entering a better resonant orbit...", (initial_node.ut - current_ut) / orbit.period(), max_orbits);
+            debug!("current rendezvous transfer would be in {:.1} orbit(s), which is above the provided maximum of {:.1}. entering a better resonant orbit...", (initial_node.ut - current_ut) / orbit.period(), max_orbits);
             let initial_node_mean_anomaly_diff = (target_orbit.mean_anomaly_at_ut(initial_node.ut)
                 - orbit.mean_anomaly_at_ut(initial_node.ut))
             .normalize_signed();
@@ -157,7 +157,7 @@ impl FlightComputer {
         let current_ut = self.space_center.get_ut().await?;
         orbit = LocalOrbit::from_orbit(&non_local_orbit).await?;
         debug!(
-            "rendevous complete, arrived {:.1}m from target",
+            "rendezvous complete, arrived {:.1}m from target",
             (orbit.position_at_ut(current_ut) - target_orbit.position_at_ut(current_ut))
                 .magnitude()
         );
