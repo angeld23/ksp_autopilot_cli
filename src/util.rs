@@ -707,6 +707,10 @@ impl FlightComputer {
     ) -> Result<f64> {
         let angle_tolerance: Rad<f64> = angle_tolerance.into();
 
+        if orbit_normal.angle(vec3(0.0, 1.0, 0.0)) <= angle_tolerance {
+            return Ok(0.0);
+        }
+
         let body_reference_frame = body.get_reference_frame().await?;
         let non_rotating_reference_frame = body.get_non_rotating_reference_frame().await?;
         let absolute_position: Vector3<f64> = self
@@ -727,12 +731,11 @@ impl FlightComputer {
             (angle_1 - current_angle).normalize_signed(),
         );
 
-        if orbit_normal.angle(vec3(0.0, 1.0, 0.0)) > angle_tolerance
-            && Rad(
-                (orbit_normal.angle(absolute_position) - Rad::full_turn() / 4.0)
-                    .0
-                    .abs(),
-            ) > angle_tolerance
+        if Rad(
+            (orbit_normal.angle(absolute_position) - Rad::full_turn() / 4.0)
+                .0
+                .abs(),
+        ) > angle_tolerance
             && Rad(angle_diff_0.0.abs().min(angle_diff_1.0.abs())) > angle_tolerance
         {
             let angle_diff =
