@@ -147,7 +147,7 @@ pub fn node_hohmann_transfer(
         guess = if next_guess >= min_guess {
             next_guess
         } else {
-            guess - (Rad::full_turn() - guess_error) / derivative
+            guess - (Rad::full_turn() - guess_error) / -derivative
         };
 
         if guess_error.0.abs() < best_guess_error.0.abs() {
