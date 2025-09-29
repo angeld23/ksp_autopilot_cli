@@ -93,8 +93,10 @@ impl FlightComputer {
             let burn_started = time_to_node <= burn_info.burn_time / 2.0;
 
             let try_rcs = self.execute_node_use_rcs && remaining_delta_v <= 1.0;
+            let mut rcs_enabled = control.get_rcs().await?;
+            let prev_rcs_enabled = rcs_enabled;
             if try_rcs && !saved_control_config.rcs {
-                control.set_rcs(true).await?;
+                rcs_enabled = true;
             }
             let rcs_force = get_translation_force(
                 &self.vessel,
@@ -103,7 +105,7 @@ impl FlightComputer {
             )
             .await?;
             if !saved_control_config.rcs && !burn_started {
-                control.set_rcs(false).await?;
+                rcs_enabled = false;
             }
 
             let rcs_burn_time = remaining_delta_v / (rcs_force / mass);
@@ -112,7 +114,7 @@ impl FlightComputer {
             if burn_started {
                 if should_use_rcs {
                     control.set_throttle(0.0).await?;
-                    control.set_rcs(true).await?;
+                    rcs_enabled = true;
                     translation_controller.enabled = true;
                     translation_controller.rcs_enabled = true;
                     translation_controller.reference_frame =
@@ -145,6 +147,10 @@ impl FlightComputer {
                     remaining_delta_v
                 );
                 break;
+            }
+
+            if prev_rcs_enabled != rcs_enabled {
+                control.set_rcs(rcs_enabled).await?;
             }
         }
 

@@ -400,8 +400,11 @@ impl FlightComputer {
                     if !overshoot_applied {
                         let final_suicide_burn_info =
                             get_burn_info(&self.vessel, impact.velocity.magnitude(), None).await?;
+                        let start_factor_earliness = final_suicide_burn_info.burn_time
+                            * (descriptor.suicide_burn_start_factor - 1.0);
                         if final_suicide_burn_info.distance_covered.is_finite() {
                             let expected_stop_position = impact.position
+                                - impact.velocity * start_factor_earliness
                                 - impact
                                     .velocity
                                     .normalize_to(final_suicide_burn_info.distance_covered);

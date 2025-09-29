@@ -219,6 +219,54 @@ pub fn node_tune_closest_approach(
     }
 }
 
+pub fn tune_closest_approach_via_node_time(
+    orbit: &LocalOrbit,
+    target_orbit: &LocalOrbit,
+    node: LocalNode,
+    desired_distance: f64,
+    search_radius: f64,
+) -> LocalNode {
+    let search_radius = search_radius.max(0.1);
+
+    // this needs to be an odd number so that a time change of 0 is always included in at least the initial search
+    let increments = 15;
+
+    let mut start = -search_radius;
+    let mut end = search_radius;
+
+    let mut closest_time_change = 0.0;
+    let mut closest_distance_error = f64::INFINITY;
+
+    for _ in 0..10 {
+        let step_size = (end - start) / (increments - 1) as f64;
+
+        for i in 0..increments {
+            let time_change = start + i as f64 * step_size;
+            let changed_node = LocalNode {
+                ut: node.ut + time_change,
+                burn_vector: node.burn_vector,
+            };
+            let changed_orbit = orbit.after_node(changed_node);
+            let (_, approach_distance) =
+                changed_orbit.find_closest_approach(target_orbit, node.ut, changed_orbit.period());
+            let distance_error = (approach_distance - desired_distance).abs();
+
+            if distance_error < closest_distance_error {
+                closest_distance_error = distance_error;
+                closest_time_change = time_change;
+            }
+        }
+
+        start = closest_time_change - step_size;
+        end = closest_time_change + step_size;
+    }
+
+    LocalNode {
+        ut: node.ut + closest_time_change,
+        burn_vector: node.burn_vector,
+    }
+}
+
 pub fn node_tune_body_periapsis(
     orbit: &LocalOrbit,
     target_body: &LocalBody,
@@ -243,7 +291,6 @@ pub fn node_tune_body_periapsis(
 
         for i in 0..increments {
             let speed_change = start + i as f64 * step_size;
-
             let changed_orbit = orbit.body.create_orbit_from_state_vectors(
                 ut,
                 orbit.position_at_ut(ut),
@@ -284,26 +331,99 @@ pub fn node_tune_body_periapsis(
     }
 }
 
+pub fn tune_body_periapsis_via_node_time(
+    orbit: &LocalOrbit,
+    target_body: &LocalBody,
+    node: LocalNode,
+    desired_periapsis: f64,
+    search_radius: f64,
+) -> LocalNode {
+    let search_radius = search_radius.max(0.1);
+
+    let target_orbit = target_body.orbit.as_ref().unwrap();
+    // this needs to be an odd number so that a time change of 0 is always included in at least the initial search
+    let increments = 11;
+
+    let mut start = -search_radius;
+    let mut end = search_radius;
+
+    let mut closest_time_change = 0.0;
+    let mut closest_distance_error = f64::INFINITY;
+
+    for _ in 0..7 {
+        let step_size = (end - start) / (increments - 1) as f64;
+
+        for i in 0..increments {
+            let time_change = start + i as f64 * step_size;
+            let changed_node = LocalNode {
+                ut: node.ut + time_change,
+                burn_vector: node.burn_vector,
+            };
+            let changed_orbit = orbit.after_node(changed_node);
+
+            if let Some(enter_ut) =
+                target_body.find_soi_enter(&changed_orbit, node.ut, changed_orbit.period())
+            {
+                let position =
+                    changed_orbit.position_at_ut(enter_ut) - target_orbit.position_at_ut(enter_ut);
+                let velocity =
+                    changed_orbit.velocity_at_ut(enter_ut) - target_orbit.velocity_at_ut(enter_ut);
+
+                let enter_orbit =
+                    target_body.create_orbit_from_state_vectors(enter_ut, position, velocity);
+
+                let periapsis = enter_orbit.periapsis()
+                    * enter_orbit.normal().dot(changed_orbit.normal()).signum();
+                let distance_error = (periapsis - desired_periapsis).abs();
+
+                if distance_error < closest_distance_error {
+                    closest_distance_error = distance_error;
+                    closest_time_change = time_change;
+                }
+            }
+        }
+
+        start = closest_time_change - step_size;
+        end = closest_time_change + step_size;
+    }
+
+    LocalNode {
+        ut: node.ut + closest_time_change,
+        burn_vector: node.burn_vector,
+    }
+}
+
 pub fn node_hohmann_transfer_to_body(
     orbit: &LocalOrbit,
     target_body: &LocalBody,
     desired_periapsis: f64,
     current_ut: f64,
+    use_time_tuning: bool,
 ) -> LocalNode {
     let target_orbit = target_body.orbit.as_ref().unwrap();
     let node = node_hohmann_transfer(orbit, target_orbit, 0.0, current_ut);
     let transfer_orbit = orbit.after_node(node);
-    let tune_node = node_tune_body_periapsis(
-        &transfer_orbit,
-        target_body,
-        node.ut,
-        desired_periapsis,
-        node.burn_vector.magnitude() / 2.0,
-    );
 
-    LocalNode {
-        ut: node.ut,
-        burn_vector: node.burn_vector + tune_node.burn_vector,
+    if use_time_tuning {
+        tune_body_periapsis_via_node_time(
+            orbit,
+            target_body,
+            node,
+            desired_periapsis,
+            (node.ut - current_ut) * 0.75,
+        )
+    } else {
+        let tune_node = node_tune_body_periapsis(
+            &transfer_orbit,
+            target_body,
+            node.ut,
+            desired_periapsis,
+            node.burn_vector.magnitude() / 2.0,
+        );
+        LocalNode {
+            ut: node.ut,
+            burn_vector: node.burn_vector + tune_node.burn_vector,
+        }
     }
 }
 

@@ -16,6 +16,10 @@ pub struct TransferArgs {
     /// Otherwise, it defaults to 0.
     #[clap(long, short)]
     distance: Option<f64>,
+    /// Whether the periapsis should be tuned by adjusting the transfer velocity instead of the transfer time.
+    /// Only relevant if you're transfering to a body.
+    #[clap(long, short = 's', default_value_t = false)]
+    use_speed_tuning_for_body: bool,
 }
 
 pub async fn transfer_command(computer: &FlightComputer, args: &TransferArgs) -> Result<()> {
@@ -33,8 +37,9 @@ pub async fn transfer_command(computer: &FlightComputer, args: &TransferArgs) ->
         node_hohmann_transfer_to_body(
             &orbit,
             &target_body,
-            target_body.radius + altitude,
+            target_body.radius * altitude.signum() + altitude,
             computer.space_center.get_ut().await?,
+            !args.use_speed_tuning_for_body,
         )
         .to_node(&computer.vessel)
         .await?;
