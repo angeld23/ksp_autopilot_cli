@@ -8,8 +8,6 @@ use cgmath::{
 };
 use krpc_client::services::space_center::{CelestialBody, Node, Orbit, SpaceCenter, Vessel};
 
-use crate::util::flatten_vector;
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct LocalOrbit {
     pub body: Box<LocalBody>,
@@ -97,10 +95,8 @@ impl LocalOrbit {
         let mut guess = if self.is_elliptical() {
             mean_anomaly
         } else {
-            let m = mean_anomaly.0;
-            let sign = if m >= 0.0 { 1.0 } else { -1.0 };
-            let h0 = (2.0 * m.abs() / self.eccentricity + 1.8).ln() * sign;
-            Rad(h0)
+            Rad((2.0 * mean_anomaly.0.abs() / self.eccentricity + 1.8).ln()
+                * mean_anomaly.0.signum())
         };
         for _ in 0..30 {
             if self.is_elliptical() {
@@ -174,12 +170,11 @@ impl LocalOrbit {
         local_vector.x * x + local_vector.y * y
     }
 
-    pub fn absolute_to_local_vector(&self, absolute: Vector3<f64>) -> Vector2<f64> {
-        let absolute = flatten_vector(absolute, self.normal());
+    pub fn absolute_to_local_vector(&self, absolute_vector: Vector3<f64>) -> Vector2<f64> {
         let x = self.periapsis_direction();
         let y = x.cross(self.normal());
 
-        vec2(x.dot(absolute), y.dot(absolute))
+        vec2(x.dot(absolute_vector), y.dot(absolute_vector))
     }
 
     pub fn position_at_ut(&self, ut: f64) -> Vector3<f64> {
@@ -191,8 +186,7 @@ impl LocalOrbit {
     }
 
     pub fn true_anomaly_at_ut(&self, ut: f64) -> Rad<f64> {
-        let local_position = self.local_position_at_ut(ut);
-        Rad(local_position.y.atan2(local_position.x))
+        self.true_anomaly_of_local_position(self.local_position_at_ut(ut))
     }
 
     pub fn periapsis(&self) -> f64 {
@@ -368,7 +362,7 @@ impl LocalOrbit {
 
         let mut bisect_start = start_ut;
         let mut bisect_end = if self.is_elliptical() {
-            start_ut + self.mean_anomaly_time_delay(Rad::full_turn() / 2.0)
+            start_ut + self.period() / 2.0
                 - self.mean_anomaly_time_delay(self.mean_anomaly_at_ut(start_ut))
         } else {
             let mut offset = 100.0;
@@ -520,7 +514,7 @@ impl LocalBody {
     ) -> LocalOrbit {
         let specific_angular_momentum = velocity.cross(position);
         let ascending_node_vector = specific_angular_momentum.cross(vec3(0.0, 1.0, 0.0));
-        let eccentricity_vector = (specific_angular_momentum.cross(velocity))
+        let eccentricity_vector = specific_angular_momentum.cross(velocity)
             / self.gravitational_parameter
             - position.normalize();
         let semi_latus_rectum =
@@ -537,6 +531,8 @@ impl LocalBody {
         .normalize();
         let true_anomaly_at_epoch =
             eccentricity_vector.angle(position) * position.dot(velocity).signum();
+        let longitude_of_periapsis =
+            (argument_of_periapsis + longitude_of_ascending_node).normalize();
 
         let mut orbit = LocalOrbit {
             body: Box::new(self.clone()),
@@ -544,8 +540,7 @@ impl LocalBody {
             semi_major_axis,
             inclination,
             longitude_of_ascending_node,
-            longitude_of_periapsis: (argument_of_periapsis + longitude_of_ascending_node)
-                .normalize(),
+            longitude_of_periapsis,
             epoch: ut,
             mean_anomaly_at_epoch: Rad(0.0),
         };
@@ -798,7 +793,7 @@ impl LocalUniverse {
     pub fn fill_orbital_trajectory(&self, trajectory: &mut OrbitalTrajectory, end_ut: f64) {
         assert!(!trajectory.state_changes.is_empty(), "trajectory is empty");
 
-        if trajectory.state_changes.last().unwrap().ut > end_ut {
+        if trajectory.state_changes.last().unwrap().ut >= end_ut {
             return;
         }
 
